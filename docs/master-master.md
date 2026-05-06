@@ -134,10 +134,62 @@ docker run --rm --network host \
   replicon:local probe -config /config/master-master.example.json
 ```
 
+## DDL Tracking
+
+PostgreSQL logical replication does not replicate DDL. replicon can capture DDL via event triggers and replay it to other nodes:
+
+```bash
+replicon ddl-setup -config replicon-mm.json    # install event triggers on all nodes
+replicon ddl-sync -config replicon-mm.json     # replay pending DDL to other nodes
+```
+
+This is not real-time — run `ddl-sync` after making schema changes, or schedule it on a cron. See the [README](../README.md#ddl-tracking-and-sync) for details and caveats.
+
+## Conflict Detection
+
+Check for stalled subscriptions or logged conflicts:
+
+```bash
+replicon conflicts -config replicon-mm.json
+```
+
+Configure a resolution strategy in the config:
+
+```json
+{
+  "logical": {
+    "conflict_resolution": {
+      "strategy": "skip"
+    }
+  }
+}
+```
+
+Available strategies: `log` (default — stalls until manual resolution), `skip` (advances past the conflict, lossy), `last_write_wins` (application-level pattern, not enforced by replicon).
+
+## Multi-Node Logical Replication
+
+For more than two writable nodes, use `logical.nodes` instead of `node_a`/`node_b`:
+
+```json
+{
+  "logical": {
+    "database": "appdb",
+    "nodes": [
+      { "name": "us-east", "host": "10.0.0.10", ... },
+      { "name": "us-west", "host": "10.0.0.11", ... },
+      { "name": "eu-central", "host": "10.0.0.12", ... }
+    ]
+  }
+}
+```
+
+`ddl-sync` and `conflicts` operate across all nodes. `verify` and `probe` currently only support the two-node `node_a`/`node_b` configuration.
+
 ## Operational Notes
 
-- Logical replication does not make concurrent writes conflict-safe.
-- Logical replication does not automatically replicate databases, schemas, or table DDL. Create matching structures on both nodes before replicating data.
+- Logical replication does not make concurrent writes conflict-safe. The application must partition writes.
+- Logical replication does not replicate databases, schemas, or table DDL. Use `ddl-setup` and `ddl-sync` or create matching structures manually.
 - Bidirectional subscriptions must avoid republishing replicated changes. The rendered setup uses `origin = none` for this.
 - The DSN user must be able to create and modify `public.replicon_replication_probe`.
 - `probe` refreshes both subscriptions after creating the probe table so the table is included in the publications.
