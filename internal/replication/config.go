@@ -45,13 +45,50 @@ func (c Config) IsCluster() bool {
 
 // Failover configures the automatic failover watchdog.
 type Failover struct {
-	Enabled            bool   `json:"enabled"`
-	CheckIntervalSec   int    `json:"check_interval_sec"`
-	HealthTimeoutSec   int    `json:"health_timeout_sec"`
-	MaxFailures        int    `json:"max_failures"`
-	FenceTimeoutSec    int    `json:"fence_timeout_sec"`
-	FenceCommand       string `json:"fence_command,omitempty"`
-	PostPromoteCommand string `json:"post_promote_command,omitempty"`
+	Enabled            bool          `json:"enabled"`
+	CheckIntervalSec   int           `json:"check_interval_sec"`
+	HealthTimeoutSec   int           `json:"health_timeout_sec"`
+	MaxFailures        int           `json:"max_failures"`
+	FenceTimeoutSec    int           `json:"fence_timeout_sec"`
+	FenceCommand       string        `json:"fence_command,omitempty"`
+	PostPromoteCommand string        `json:"post_promote_command,omitempty"`
+	Witness            WitnessConfig `json:"witness,omitempty"`
+}
+
+// WitnessConfig defines an independent observer that breaks ties when the
+// watchdog cannot fence the primary via SSH. If both the watchdog and the
+// witness agree the primary is unreachable, promotion proceeds without
+// fencing — the two-observer agreement replaces the fence as the
+// split-brain prevention mechanism.
+type WitnessConfig struct {
+	Enabled bool   `json:"enabled"`
+	DSN     string `json:"dsn,omitempty"`
+	DSNEnv  string `json:"dsn_env,omitempty"`
+}
+
+func (w WitnessConfig) ResolveDSN() (string, error) {
+	if value := strings.TrimSpace(w.DSN); value != "" {
+		return value, nil
+	}
+	if envName := strings.TrimSpace(w.DSNEnv); envName != "" {
+		value := strings.TrimSpace(os.Getenv(envName))
+		if value == "" {
+			return "", fmt.Errorf("environment variable %q is not set", envName)
+		}
+		return value, nil
+	}
+	return "", errors.New("witness dsn or dsn_env is required")
+}
+
+// ConflictResolution configures how logical replication conflicts are handled.
+type ConflictResolution struct {
+	Strategy string `json:"strategy"` // "last_write_wins", "skip", "log"
+}
+
+// DDLReplication configures automatic DDL tracking and replay for
+// master-master logical replication.
+type DDLReplication struct {
+	Enabled bool `json:"enabled"`
 }
 
 type NodeConfig struct {
@@ -72,12 +109,28 @@ type Network struct {
 }
 
 type LogicalSetup struct {
-	Database        string `json:"database"`
-	PublicationA    string `json:"publication_a"`
-	PublicationB    string `json:"publication_b"`
-	SubscriptionA   string `json:"subscription_a"`
-	SubscriptionB   string `json:"subscription_b"`
-	ReplicationCIDR string `json:"replication_cidr"`
+	Database           string             `json:"database"`
+	PublicationA       string             `json:"publication_a"`
+	PublicationB       string             `json:"publication_b"`
+	SubscriptionA      string             `json:"subscription_a"`
+	SubscriptionB      string             `json:"subscription_b"`
+	ReplicationCIDR    string             `json:"replication_cidr"`
+	Nodes              []NodeConfig       `json:"nodes,omitempty"`
+	ConflictResolution ConflictResolution `json:"conflict_resolution,omitempty"`
+	DDLReplication     DDLReplication     `json:"ddl_replication,omitempty"`
+}
+
+// ResolveLogicalNodes returns the effective list of logical replication nodes.
+// If Nodes is populated (multi-primary), it is returned. Otherwise NodeA and
+// NodeB from the parent Config are returned as a two-element slice.
+func (c Config) ResolveLogicalNodes() []NodeConfig {
+	if len(c.Logical.Nodes) > 0 {
+		return c.Logical.Nodes
+	}
+	if c.NodeA.Name != "" && c.NodeB.Name != "" {
+		return []NodeConfig{c.NodeA, c.NodeB}
+	}
+	return nil
 }
 
 func LoadConfig(path string) (Config, error) {

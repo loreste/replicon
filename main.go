@@ -57,6 +57,12 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runPreflight(args[1:], stdout)
 	case "watch":
 		return runWatch(args[1:], stdout)
+	case "ddl-setup":
+		return runDDLSetup(args[1:], stdout)
+	case "ddl-sync":
+		return runDDLSync(args[1:], stdout)
+	case "conflicts":
+		return runConflicts(args[1:], stdout)
 	case "history":
 		return runHistory(args[1:], stdout)
 	case "serve":
@@ -458,6 +464,69 @@ func runWatch(args []string, stdout io.Writer) error {
 	return nil
 }
 
+func runDDLSetup(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("ddl-setup", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to JSON configuration")
+	output := fs.String("output", "text", "output format: text or json")
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := replication.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if err := replication.ValidateConfig(cfg); err != nil {
+		return err
+	}
+
+	result, err := replication.SetupDDLTrackingAll(cfg)
+	return writeResult(stdout, result, *output, err)
+}
+
+func runDDLSync(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("ddl-sync", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to JSON configuration")
+	output := fs.String("output", "text", "output format: text or json")
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := replication.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if err := replication.ValidateConfig(cfg); err != nil {
+		return err
+	}
+
+	result, err := replication.SyncDDL(cfg)
+	return writeResult(stdout, result, *output, err)
+}
+
+func runConflicts(args []string, stdout io.Writer) error {
+	fs := flag.NewFlagSet("conflicts", flag.ContinueOnError)
+	configPath := fs.String("config", "", "path to JSON configuration")
+	output := fs.String("output", "text", "output format: text or json")
+	fs.SetOutput(io.Discard)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	cfg, err := replication.LoadConfig(*configPath)
+	if err != nil {
+		return err
+	}
+	if err := replication.ValidateConfig(cfg); err != nil {
+		return err
+	}
+
+	result, err := replication.CheckConflicts(cfg)
+	return writeResult(stdout, result, *output, err)
+}
+
 func runPromote(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("promote", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to JSON configuration")
@@ -575,6 +644,9 @@ Usage:
   replicon rejoin -config replicon.json [-execute] [-skip-preflight] [-output text|json] [-audit-log path]
   replicon preflight -config replicon.json [-output text|json]
   replicon watch -config replicon.json [-audit-log path] [-dry-run]
+  replicon ddl-setup -config replicon.json [-output text|json]
+  replicon ddl-sync -config replicon.json [-output text|json]
+  replicon conflicts -config replicon.json [-output text|json]
   replicon history [-audit-log path] [-limit 20] [-output text|json]
   replicon serve -config replicon.json -tls-cert server.crt -tls-key server.key [-listen :8080] [-audit-log path]
   replicon version`)
