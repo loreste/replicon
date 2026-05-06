@@ -12,6 +12,13 @@ import (
 
 const ddlTrackingTable = "public.replicon_ddl_log"
 
+type ddlEntry struct {
+	ID             int64
+	Command        string
+	ObjectType     string
+	ObjectIdentity string
+}
+
 // SetupDDLTracking installs event triggers on a node that capture DDL
 // statements into a tracking table. The tracking table is excluded from
 // publications to avoid replication loops — DDL is replayed by replicon,
@@ -83,103 +90,14 @@ func SyncDDL(cfg Config) (CommandResult, error) {
 
 	// For each pair of nodes, replay DDL from one to all others.
 	for i, source := range nodes {
-		sourceDSN, err := source.ResolveDSN()
+		replayed, err := syncDDLFromSource(ctx, source, i, nodes)
 		if err != nil {
 			result.Status = "error"
-			result.Error = fmt.Sprintf("resolve %s dsn: %s", source.Name, err)
+			result.Error = err.Error()
 			result.Finalize()
-			return result, errors.New(result.Error)
+			return result, err
 		}
-
-		sourceConn, err := pgx.Connect(ctx, sourceDSN)
-		if err != nil {
-			result.Status = "error"
-			result.Error = fmt.Sprintf("connect %s: %s", source.Name, redactConnectionError(err))
-			result.Finalize()
-			return result, errors.New(result.Error)
-		}
-		defer sourceConn.Close(ctx)
-
-		// Read unreplayed DDL from this source.
-		rows, err := sourceConn.Query(ctx, `
-			SELECT id, command, object_type, object_identity
-			FROM `+ddlTrackingTable+`
-			WHERE replayed = false AND source_node = ''
-			ORDER BY id
-		`)
-		if err != nil {
-			// Table may not exist yet — not an error.
-			continue
-		}
-
-		type ddlEntry struct {
-			ID             int64
-			Command        string
-			ObjectType     string
-			ObjectIdentity string
-		}
-
-		var entries []ddlEntry
-		for rows.Next() {
-			var e ddlEntry
-			if err := rows.Scan(&e.ID, &e.Command, &e.ObjectType, &e.ObjectIdentity); err != nil {
-				rows.Close()
-				continue
-			}
-			entries = append(entries, e)
-		}
-		rows.Close()
-
-		if len(entries) == 0 {
-			continue
-		}
-
-		// Replay on all other nodes.
-		for j, target := range nodes {
-			if i == j {
-				continue
-			}
-
-			targetDSN, err := target.ResolveDSN()
-			if err != nil {
-				continue
-			}
-
-			targetConn, err := pgx.Connect(ctx, targetDSN)
-			if err != nil {
-				continue
-			}
-
-			for _, e := range entries {
-				// Disable the event trigger on the target to avoid re-capturing
-				// the replayed DDL.
-				_, _ = targetConn.Exec(ctx, `
-					ALTER EVENT TRIGGER replicon_ddl_capture DISABLE
-				`)
-
-				_, execErr := targetConn.Exec(ctx, e.Command)
-
-				_, _ = targetConn.Exec(ctx, `
-					ALTER EVENT TRIGGER replicon_ddl_capture ENABLE
-				`)
-
-				if execErr != nil {
-					// Log but continue — some DDL may already exist on the target.
-					continue
-				}
-
-				totalReplayed++
-			}
-
-			targetConn.Close(ctx)
-		}
-
-		// Mark all entries as replayed on the source.
-		for _, e := range entries {
-			_, _ = sourceConn.Exec(ctx, `
-				UPDATE `+ddlTrackingTable+` SET replayed = true WHERE id = $1
-			`, e.ID)
-		}
+		totalReplayed += replayed
 	}
 
 	result.Summary = fmt.Sprintf("DDL sync complete: %d statements replayed", totalReplayed)
@@ -242,4 +160,89 @@ func SetupDDLTrackingAll(cfg Config) (CommandResult, error) {
 	}
 	result.Finalize()
 	return result, nil
+}
+
+func syncDDLFromSource(ctx context.Context, source NodeConfig, sourceIdx int, nodes []NodeConfig) (int, error) {
+	sourceDSN, err := source.ResolveDSN()
+	if err != nil {
+		return 0, fmt.Errorf("resolve %s dsn: %s", source.Name, err)
+	}
+
+	sourceConn, err := pgx.Connect(ctx, sourceDSN)
+	if err != nil {
+		return 0, fmt.Errorf("connect %s: %s", source.Name, redactConnectionError(err))
+	}
+	defer sourceConn.Close(ctx)
+
+	// Read unreplayed DDL from this source.
+	rows, err := sourceConn.Query(ctx, `
+		SELECT id, command, object_type, object_identity
+		FROM `+ddlTrackingTable+`
+		WHERE replayed = false AND source_node = ''
+		ORDER BY id
+	`)
+	if err != nil {
+		// Table may not exist yet — not an error.
+		return 0, nil
+	}
+	defer rows.Close()
+
+	var entries []ddlEntry
+	for rows.Next() {
+		var e ddlEntry
+		if err := rows.Scan(&e.ID, &e.Command, &e.ObjectType, &e.ObjectIdentity); err != nil {
+			continue
+		}
+		entries = append(entries, e)
+	}
+
+	if len(entries) == 0 {
+		return 0, nil
+	}
+
+	totalReplayed := 0
+
+	// Replay on all other nodes.
+	for j, target := range nodes {
+		if sourceIdx == j {
+			continue
+		}
+
+		targetDSN, err := target.ResolveDSN()
+		if err != nil {
+			continue
+		}
+
+		targetConn, err := pgx.Connect(ctx, targetDSN)
+		if err != nil {
+			continue
+		}
+
+		replayed := replayDDLEntries(ctx, targetConn, entries)
+		totalReplayed += replayed
+		targetConn.Close(ctx)
+	}
+
+	// Mark all entries as replayed on the source.
+	for _, e := range entries {
+		_, _ = sourceConn.Exec(ctx, `
+			UPDATE `+ddlTrackingTable+` SET replayed = true WHERE id = $1
+		`, e.ID)
+	}
+
+	return totalReplayed, nil
+}
+
+func replayDDLEntries(ctx context.Context, conn *pgx.Conn, entries []ddlEntry) int {
+	replayed := 0
+	for _, e := range entries {
+		_, _ = conn.Exec(ctx, `ALTER EVENT TRIGGER replicon_ddl_capture DISABLE`)
+		_, execErr := conn.Exec(ctx, e.Command)
+		_, _ = conn.Exec(ctx, `ALTER EVENT TRIGGER replicon_ddl_capture ENABLE`)
+		if execErr != nil {
+			continue
+		}
+		replayed++
+	}
+	return replayed
 }

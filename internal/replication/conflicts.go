@@ -78,59 +78,8 @@ func CheckConflicts(cfg Config) (CommandResult, error) {
 	var conflicts []map[string]any
 
 	for _, node := range nodes {
-		dsn, err := node.ResolveDSN()
-		if err != nil {
-			continue
-		}
-
-		conn, err := pgx.Connect(ctx, dsn)
-		if err != nil {
-			continue
-		}
-
-		// Check for disabled or errored subscriptions.
-		rows, err := conn.Query(ctx, `
-			SELECT s.subname,
-			       CASE WHEN ss.pid IS NULL THEN 'down' ELSE 'streaming' END AS status,
-			       COALESCE(ss.latest_end_lsn::text, '') AS latest_lsn
-			FROM pg_subscription s
-			LEFT JOIN pg_stat_subscription ss ON ss.subname = s.subname
-			WHERE ss.pid IS NULL
-		`)
-		if err != nil {
-			conn.Close(ctx)
-			continue
-		}
-
-		for rows.Next() {
-			var subName, status, latestLSN string
-			if err := rows.Scan(&subName, &status, &latestLSN); err != nil {
-				continue
-			}
-			conflicts = append(conflicts, map[string]any{
-				"node":         node.Name,
-				"subscription": subName,
-				"status":       status,
-				"latest_lsn":   latestLSN,
-			})
-		}
-		rows.Close()
-
-		// Check the conflict log if it exists.
-		var logCount int
-		err = conn.QueryRow(ctx, `
-			SELECT count(*) FROM `+conflictLogTable+`
-			WHERE detected_at > now() - interval '24 hours'
-		`).Scan(&logCount)
-		if err == nil && logCount > 0 {
-			conflicts = append(conflicts, map[string]any{
-				"node":               node.Name,
-				"recent_conflicts":   logCount,
-				"period":             "24h",
-			})
-		}
-
-		conn.Close(ctx)
+		nodeConflicts := checkNodeConflicts(ctx, node)
+		conflicts = append(conflicts, nodeConflicts...)
 	}
 
 	if len(conflicts) == 0 {
@@ -143,6 +92,64 @@ func CheckConflicts(cfg Config) (CommandResult, error) {
 	}
 	result.Finalize()
 	return result, nil
+}
+
+func checkNodeConflicts(ctx context.Context, node NodeConfig) []map[string]any {
+	dsn, err := node.ResolveDSN()
+	if err != nil {
+		return nil
+	}
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return nil
+	}
+	defer conn.Close(ctx)
+
+	var conflicts []map[string]any
+
+	// Check for disabled or errored subscriptions.
+	rows, err := conn.Query(ctx, `
+		SELECT s.subname,
+		       CASE WHEN ss.pid IS NULL THEN 'down' ELSE 'streaming' END AS status,
+		       COALESCE(ss.latest_end_lsn::text, '') AS latest_lsn
+		FROM pg_subscription s
+		LEFT JOIN pg_stat_subscription ss ON ss.subname = s.subname
+		WHERE ss.pid IS NULL
+	`)
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var subName, status, latestLSN string
+		if err := rows.Scan(&subName, &status, &latestLSN); err != nil {
+			continue
+		}
+		conflicts = append(conflicts, map[string]any{
+			"node":         node.Name,
+			"subscription": subName,
+			"status":       status,
+			"latest_lsn":   latestLSN,
+		})
+	}
+
+	// Check the conflict log if it exists.
+	var logCount int
+	err = conn.QueryRow(ctx, `
+		SELECT count(*) FROM `+conflictLogTable+`
+		WHERE detected_at > now() - interval '24 hours'
+	`).Scan(&logCount)
+	if err == nil && logCount > 0 {
+		conflicts = append(conflicts, map[string]any{
+			"node":             node.Name,
+			"recent_conflicts": logCount,
+			"period":           "24h",
+		})
+	}
+
+	return conflicts
 }
 
 // SkipConflict advances a stalled subscription past the conflicting
