@@ -1,92 +1,73 @@
 # replicon
 
-A Go CLI and API for managing PostgreSQL replication — setup, verification, failover, and monitoring across master-slave, cluster, and master-master topologies.
+A Go CLI and API for managing PostgreSQL replication — setup, verification, failover, and monitoring.
 
 ## Why this exists
 
 PostgreSQL replication works well once configured. The problem is getting there and staying confident it's working.
 
-**Setup is manual and error-prone.** A primary-standby pair requires coordinated changes across `postgresql.conf`, `pg_hba.conf`, replication roles, replication slots, `pg_basebackup`, and recovery parameters. Each step depends on the previous one being correct, and mistakes fail silently — a wrong CIDR block means the standby just never connects. For logical replication the surface area doubles: both nodes need matching schemas, publications, cross-subscriptions, and the `origin = none` flag to prevent infinite loops.
+**Setup is manual and error-prone.** A primary-standby pair requires coordinated changes across `postgresql.conf`, `pg_hba.conf`, replication roles, replication slots, `pg_basebackup`, and recovery parameters. Each step depends on the previous one being correct, and mistakes fail silently. For logical replication the surface area doubles: both nodes need matching schemas, publications, cross-subscriptions, and the `origin = none` flag to prevent infinite loops.
 
-**There is no built-in way to confirm data is actually flowing.** `pg_stat_replication` shows a connection exists. It does not prove rows are replicating. A subscription can show `streaming` in `pg_stat_subscription` while the apply worker is stuck. The only proof is writing data on one side and confirming it appears on the other.
+**There is no built-in way to confirm data is actually flowing.** `pg_stat_replication` shows a connection exists, not that rows are replicating. The only proof is writing data on one side and confirming it appears on the other.
 
-**Failover under pressure is where mistakes happen.** `pg_promote()` is simple, but the steps around it — fencing the old primary, choosing the best standby in a cluster, rebuilding the old primary as a standby — are easy to get wrong when you're in an incident.
+**Failover under pressure is where mistakes happen.** `pg_promote()` is simple, but the steps around it — fencing the old primary, choosing the best standby, rebuilding the old primary as a standby — are easy to get wrong in an incident.
 
-**Configuration is scattered.** Replication settings live across multiple files and PostgreSQL catalog tables. There is no single source of truth for what the topology should look like.
+**Configuration is scattered.** Replication settings live across multiple files and PostgreSQL catalog tables with no single source of truth.
 
 ### How replicon compares
 
-| Tool | What it does | When to use it instead of replicon |
-|------|-------------|-------------------------------------|
-| **Patroni** / **Stolon** | Full HA orchestrators with leader election via etcd/ZooKeeper/Consul. Manage the entire PostgreSQL lifecycle. | You need consensus-based automatic failover across large clusters and are willing to run a DCS. |
-| **repmgr** | Replication manager with witness nodes and daemon-based monitoring. | You want a mature, well-documented replication manager with its own daemon process. |
-| **pg_basebackup** | Low-level PostgreSQL tool for creating base backups. | You only need the backup step and will script everything else yourself. |
-| **pgBackRest** / **Barman** | Backup and point-in-time recovery. | Your focus is backup management, not replication topology. |
+| Tool | What it does | When to use it instead |
+|------|-------------|------------------------|
+| **Patroni** / **Stolon** | Full HA orchestrators with Raft-based leader election via etcd/ZooKeeper/Consul | You need formal distributed consensus guarantees and are willing to run a DCS |
+| **repmgr** | Replication manager with witness nodes and daemon-based monitoring | You want a mature, battle-tested replication manager |
+| **pgBackRest** / **Barman** | Backup and point-in-time recovery | Your focus is backup management, not replication topology |
 
-replicon fills a different space. It is a single static binary with no external dependencies beyond PostgreSQL and SSH. No etcd, no ZooKeeper, no Consul, no agent on the database servers.
+replicon is a single static binary with no external dependencies beyond PostgreSQL and SSH.
 
-## What replicon supports
+## Capabilities
 
-| Capability | Status |
-|------------|--------|
-| **Master-slave** (1 primary + 1 standby) | Tested on PG 13, 14, 16 |
-| **Cluster** (1 primary + N standbys) | Tested on PG 16; best-standby promotion by WAL position |
-| **Master-master** (2 writable nodes, logical replication) | Tested on PG 16; bidirectional probe confirmed |
-| **Multi-node logical replication** (N writable nodes) | DDL sync and conflict detection work across N nodes; verify and probe currently check two nodes |
-| Configuration validation | JSON schema checks, DSN parsing, CIDR validation, node uniqueness |
-| Setup rendering | Generates `postgresql.conf`, `pg_hba.conf`, SQL, and `pg_basebackup` commands |
-| Read-only verification | Queries `pg_stat_replication`, `pg_stat_subscription`, standby recovery state |
-| Active end-to-end probe | Writes a row, waits for replication, deletes it, confirms deletion replicates |
-| Manual failover (dry-run + execute) | `promote` and `rejoin` with SSH execution and preflight checks |
-| Automatic failover | `watch` command with health monitoring, fence-then-promote, and dry-run mode |
-| Witness-based failover | When SSH fencing fails, a witness node independently confirms the primary is down before promoting |
-| Cluster-aware promotion | Queries all standbys' WAL receive LSN, promotes the most up-to-date one |
-| DDL tracking and sync | Event trigger capture and cross-node replay for master-master (`ddl-setup`, `ddl-sync`) |
-| Conflict detection | Checks for stalled subscriptions and logs conflicts across all nodes |
-| Conflict handling | Configurable strategies: `skip` (advance past conflict), `log` (record and stall) |
-| TLS admin API | `/verify`, `/probe`, `/promote`, `/rejoin`, `/metrics`, `/history` endpoints |
-| Prometheus metrics | Command run counts and durations, scrapeable at `/metrics` |
-| Audit logging | Every operation recorded in append-only JSONL with credential redaction |
-| SSH preflight | Validates SSH connectivity to all nodes before destructive operations |
-| Cross-platform | Static binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 |
+### Topology modes
 
-## Architecture
+| Mode | Replication type | What replicon does |
+|------|-----------------|-------------------|
+| **Master-slave** (1 primary + 1 standby) | Physical streaming (WAL). Replicates everything — all databases, schemas, tables, roles. | `verify`, `probe`, `promote`, `rejoin`, `watch` — full lifecycle. Tested on PG 13, 14, 16. |
+| **Cluster** (1 primary + N standbys) | Physical streaming (WAL). Same as master-slave but with multiple standbys. | `verify` and `probe` check all standbys. `promote` selects the standby with the highest WAL receive LSN. Tested on PG 16. |
+| **Master-master** (2 writable nodes) | Logical (row-level, single database). Does not replicate DDL or other databases. | `verify`, `probe` (bidirectional), `ddl-setup`, `ddl-sync`, `conflicts`. Tested on PG 16. |
+| **Multi-node logical** (N writable nodes) | Logical. Same caveats as master-master. | `ddl-sync` and `conflicts` work across N nodes via `logical.nodes`. `verify` and `probe` only check two-node `node_a`/`node_b` pairs — multi-node verify is not yet implemented. |
 
-Master-slave / cluster:
+### Failover
 
-```mermaid
-flowchart LR
-    A[replicon] --> B[Primary]
-    A --> C[Standby 1]
-    A --> D[Standby 2]
-    A --> E[Standby N]
-    B -->|WAL streaming| C
-    B -->|WAL streaming| D
-    B -->|WAL streaming| E
-    A -->|verify| F[pg_stat_replication]
-    A -->|probe write| B
-    A -->|probe read| C
-    A -->|probe read| D
-    A -->|watch| G[health check -> fence -> promote best]
-```
+| Capability | How it works |
+|------------|-------------|
+| **Manual failover** | `promote` (dry-run by default, `-execute` to run over SSH) and `rejoin` (rebuilds old primary as standby) |
+| **Automatic failover** | `watch` monitors the primary, fences it via SSH after consecutive failures, promotes the best standby |
+| **Witness node** | When SSH fencing fails, a witness PostgreSQL instance on a third host independently checks if the primary is reachable. If both the watchdog and witness agree it's down, promotion proceeds without fencing. If the witness can still reach the primary, promotion is aborted (likely a network partition). This is not distributed consensus — it reduces split-brain risk but does not eliminate it. |
+| **Leader election** | Multiple `watch` agents can run against the same cluster. A coordination PostgreSQL database tracks which agent holds the leader lease. Only the leader triggers failover. If the leader stops heartbeating, another agent takes over after the lease TTL expires. Uses row-level locking and TTL — not Raft or Paxos. |
+| **Dry-run** | `watch -dry-run` monitors and logs what would happen without fencing or promoting |
+| **Cluster-aware** | In multi-standby configs, `promote` queries each standby's WAL receive position and promotes the most up-to-date one |
 
-Master-master / multi-node:
+### Master-master extras
 
-```mermaid
-flowchart LR
-    A[replicon] --> B[Node 1]
-    A --> C[Node 2]
-    A --> D[Node N]
-    B -->|Logical pub/sub| C
-    B -->|Logical pub/sub| D
-    C -->|Logical pub/sub| B
-    C -->|Logical pub/sub| D
-    D -->|Logical pub/sub| B
-    D -->|Logical pub/sub| C
-    A -->|verify| E[pg_stat_subscription]
-    A -->|ddl-sync| F[DDL capture and replay]
-    A -->|conflicts| G[conflict detection]
-```
+| Capability | How it works | Caveats |
+|------------|-------------|---------|
+| **DDL tracking** | `ddl-setup` installs PostgreSQL event triggers that capture DDL (CREATE/ALTER/DROP for tables, indexes, sequences, views, types, functions, schemas) into a tracking table | Not real-time. Run `ddl-sync` manually or on a cron. Complex data-dependent DDL may fail during replay. |
+| **DDL sync** | `ddl-sync` reads unreplayed DDL from each node and replays it on all other nodes | Disables the trigger during replay to avoid loops. Marks entries as replayed. |
+| **Conflict detection** | `conflicts` checks all nodes for stalled subscription workers and recent conflict log entries | Detection only — cannot prevent conflicts |
+| **Conflict handling** | `skip` strategy advances past the conflicting transaction (lossy). `log` strategy records and stalls. `last_write_wins` is documented as an application-level pattern — replicon does not enforce it. | PostgreSQL logical replication has no hook for custom conflict handlers |
+
+### Operations and observability
+
+| Capability | Details |
+|------------|---------|
+| **Config validation** | DSN parsing, CIDR validation, node uniqueness, mode-specific field checks |
+| **Setup rendering** | Generates `postgresql.conf`, `pg_hba.conf`, SQL, and `pg_basebackup` commands per node |
+| **Read-only verification** | Queries `pg_stat_replication` and `pg_stat_subscription` |
+| **Active probe** | Writes a row, waits for replication, deletes it, confirms deletion replicates |
+| **SSH preflight** | Validates connectivity to all nodes before destructive operations |
+| **TLS admin API** | `/verify`, `/probe`, `/promote`, `/rejoin`, `/metrics`, `/history` endpoints with API key auth |
+| **Prometheus metrics** | Command run counts and durations at `/metrics` |
+| **Audit logging** | Append-only JSONL with credential redaction |
+| **Cross-platform** | Static binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 |
 
 ## Quick Start
 
@@ -119,130 +100,17 @@ replicon verify -config replicon-mm.json
 replicon probe -config replicon-mm.json
 ```
 
-### Cluster (multiple standbys)
-
-Use the `standbys` array instead of the single `standby` field:
-
-```json
-{
-  "cluster_name": "orders-prod",
-  "mode": "master-slave",
-  "replication_user": "replicator",
-  "replication_slot": "orders_prod_standby",
-  "primary": {
-    "name": "primary",
-    "host": "10.0.0.10",
-    "port": 5432,
-    "data_dir": "/var/lib/postgresql/16/main",
-    "postgres_user": "postgres",
-    "ssh_user": "ubuntu",
-    "server_id": "pg-a",
-    "dsn_env": "REPLICON_PRIMARY_DSN"
-  },
-  "standbys": [
-    {
-      "name": "standby-1",
-      "host": "10.0.0.11",
-      "port": 5432,
-      "data_dir": "/var/lib/postgresql/16/main",
-      "postgres_user": "postgres",
-      "ssh_user": "ubuntu",
-      "server_id": "pg-b",
-      "dsn_env": "REPLICON_STANDBY_1_DSN"
-    },
-    {
-      "name": "standby-2",
-      "host": "10.0.0.12",
-      "port": 5432,
-      "data_dir": "/var/lib/postgresql/16/main",
-      "postgres_user": "postgres",
-      "ssh_user": "ubuntu",
-      "server_id": "pg-c",
-      "dsn_env": "REPLICON_STANDBY_2_DSN"
-    }
-  ],
-  "network": {
-    "replication_cidr": "10.0.0.0/24",
-    "application_name": "orders-prod-standby"
-  }
-}
-```
-
-`verify` and `probe` check all standbys. `promote` queries each standby's WAL receive position and promotes the one closest to the primary. Do not use both `standby` and `standbys`.
-
-### Multi-node logical replication
-
-For more than two writable nodes, use the `logical.nodes` array:
-
-```json
-{
-  "cluster_name": "orders-global",
-  "mode": "master-master",
-  "replication_user": "replicator",
-  "logical": {
-    "database": "appdb",
-    "replication_cidr": "10.0.0.0/24",
-    "nodes": [
-      {
-        "name": "us-east",
-        "host": "10.0.0.10",
-        "port": 5432,
-        "data_dir": "/var/lib/postgresql/16/main",
-        "postgres_user": "postgres",
-        "ssh_user": "ubuntu",
-        "server_id": "pg-us-east",
-        "dsn_env": "REPLICON_US_EAST_DSN"
-      },
-      {
-        "name": "us-west",
-        "host": "10.0.0.11",
-        "port": 5432,
-        "data_dir": "/var/lib/postgresql/16/main",
-        "postgres_user": "postgres",
-        "ssh_user": "ubuntu",
-        "server_id": "pg-us-west",
-        "dsn_env": "REPLICON_US_WEST_DSN"
-      },
-      {
-        "name": "eu-central",
-        "host": "10.0.0.12",
-        "port": 5432,
-        "data_dir": "/var/lib/postgresql/16/main",
-        "postgres_user": "postgres",
-        "ssh_user": "ubuntu",
-        "server_id": "pg-eu",
-        "dsn_env": "REPLICON_EU_DSN"
-      }
-    ],
-    "conflict_resolution": {
-      "strategy": "last_write_wins"
-    },
-    "ddl_replication": {
-      "enabled": true
-    }
-  }
-}
-```
-
-Each node publishes to and subscribes from every other node. Publications, subscriptions, and `pg_hba.conf` entries must be created manually on each node — replicon does not automate the initial mesh setup. Once the mesh is running, `ddl-sync` and `conflicts` operate across all nodes. `verify` and `probe` currently work with the two-node `node_a`/`node_b` configuration; multi-node verification is not yet implemented.
-
-The application must partition writes to avoid conflicts. Existing two-node configs with `node_a`/`node_b` continue to work unchanged.
-
 ## Failover
 
-### Manual (dry-run first)
+### Manual
 
 ```bash
-replicon promote -config replicon.json           # shows what would happen
-replicon promote -config replicon.json -execute   # runs it over SSH
+replicon promote -config replicon.json           # dry-run: shows commands
+replicon promote -config replicon.json -execute   # runs over SSH
 replicon rejoin -config replicon.json -execute    # rebuilds old primary as standby
 ```
 
-In cluster mode, `promote` automatically selects the standby with the most recent WAL receive position.
-
 ### Automatic
-
-Add a `failover` section to your config:
 
 ```json
 {
@@ -253,166 +121,43 @@ Add a `failover` section to your config:
     "max_failures": 3,
     "fence_timeout_sec": 10,
     "fence_command": "sudo systemctl stop postgresql",
-    "post_promote_command": ""
+    "post_promote_command": "",
+    "witness": {
+      "enabled": false,
+      "dsn_env": "REPLICON_WITNESS_DSN"
+    },
+    "election": {
+      "enabled": false,
+      "dsn_env": "REPLICON_ELECTION_DSN",
+      "node_id": "agent-1",
+      "lease_ttl_sec": 30,
+      "renew_sec": 10
+    }
   }
 }
 ```
-
-Start the watchdog:
 
 ```bash
 replicon watch -config replicon.json -audit-log var/audit/replicon.jsonl
+replicon watch -config replicon.json -dry-run    # monitor without acting
 ```
 
-Test the watchdog without risking a real failover:
+**Watchdog flow:**
 
-```bash
-replicon watch -config replicon.json -dry-run
-```
+1. Check primary health every `check_interval_sec` via SQL
+2. After `max_failures` consecutive failures, fence the primary via SSH
+3. If fencing succeeds, promote the best standby
+4. If fencing fails and a witness is configured, consult the witness before deciding
+5. If leader election is enabled, only the elected leader triggers failover
+6. All events recorded in the audit log
 
-The watchdog:
+**Leader election flow:**
 
-1. Checks primary health every `check_interval_sec` via SQL connection
-2. After `max_failures` consecutive failures, fences the primary via SSH
-3. If fencing succeeds, promotes the best standby (by WAL position in cluster mode)
-4. If fencing fails, consults the witness node (if configured) before deciding
-5. Optionally runs `post_promote_command` on the new primary
-
-All events are recorded in the audit log.
-
-| Field | Default | Description |
-|-------|---------|-------------|
-| `check_interval_sec` | 5 | Seconds between health checks |
-| `health_timeout_sec` | 3 | Timeout for each SQL health check |
-| `max_failures` | 3 | Consecutive failures before failover |
-| `fence_timeout_sec` | 10 | Timeout for the SSH fence command |
-| `fence_command` | `sudo systemctl stop postgresql` | Command to stop PostgreSQL on the primary |
-| `post_promote_command` | _(none)_ | Optional command on new primary after promotion |
-
-### Witness node
-
-When SSH to the primary also fails during an outage, the watchdog cannot fence and would normally abort promotion. A witness node solves this by providing a second independent observer.
-
-```json
-{
-  "failover": {
-    "enabled": true,
-    "max_failures": 3,
-    "witness": {
-      "enabled": true,
-      "dsn_env": "REPLICON_WITNESS_DSN"
-    }
-  }
-}
-```
-
-The witness is a PostgreSQL instance on a third host (can be a small instance — it is only used for health checks). When fencing fails:
-
-1. The watchdog connects to the witness database
-2. If the `dblink` extension is installed on the witness, it attempts to reach the primary from the witness's network. If dblink says the primary is still alive, promotion is aborted — the outage is a network partition, not a real failure
-3. If `dblink` is not available, the watchdog uses two-observer agreement: the watchdog can't reach the primary AND the witness is alive and healthy, so two independent observers on different networks both see the primary as unreachable
-4. If both agree the primary is down, promotion proceeds without fencing
-5. If the witness is also unreachable, the watchdog does not promote — not enough information to decide
-
-This is not equivalent to distributed consensus. It reduces the risk of split-brain but does not eliminate it entirely. For the strongest guarantees, use a DCS-based orchestrator like Patroni.
-
-## DDL Tracking and Sync
-
-PostgreSQL logical replication does not replicate DDL (CREATE TABLE, ALTER TABLE, etc.). replicon provides a capture-and-replay mechanism using PostgreSQL event triggers. This is not real-time — DDL is captured as it happens, but replay to other nodes is triggered manually or on a schedule.
-
-### Setup
-
-Install DDL tracking on all master-master nodes:
-
-```bash
-replicon ddl-setup -config replicon.json
-```
-
-This creates:
-
-- A `replicon_ddl_log` tracking table on each node
-- An event trigger (`replicon_ddl_capture`) that records DDL statements as they execute
-- Captures CREATE, ALTER, and DROP for tables, indexes, sequences, views, types, functions, and schemas
-
-### Sync
-
-Replay pending DDL from each node to all other nodes:
-
-```bash
-replicon ddl-sync -config replicon.json
-```
-
-This:
-
-1. Reads unreplayed DDL entries from each node's tracking table
-2. Disables the event trigger on the target to avoid re-capturing during replay
-3. Executes each DDL statement on the target
-4. Re-enables the trigger and marks entries as replayed
-
-Run `ddl-sync` after making schema changes, or schedule it on a cron for near-automated operation. This is not instant — there is a window between DDL execution on the source and replay on other nodes. Complex DDL that depends on data (e.g. `ALTER TABLE ... USING` with data transformations) may fail during replay if the data differs across nodes.
-
-## Conflict Detection and Resolution
-
-PostgreSQL logical replication has no built-in conflict handling. A duplicate key or constraint violation from a replicated row stops the apply worker, stalling replication.
-
-### Check for conflicts
-
-```bash
-replicon conflicts -config replicon.json
-```
-
-This checks all nodes for:
-
-- Stalled subscription workers (apply worker not running)
-- Recent entries in the `replicon_conflict_log` table
-
-### Resolution strategies
-
-Configure in the `logical.conflict_resolution` section:
-
-```json
-{
-  "logical": {
-    "conflict_resolution": {
-      "strategy": "skip"
-    }
-  }
-}
-```
-
-| Strategy | Behavior |
-|----------|----------|
-| `log` (default) | Logs the conflict to `replicon_conflict_log`. Replication stalls until manually resolved. |
-| `skip` | Logs the conflict and advances the subscription past the conflicting transaction. The conflicting row is lost on the subscriber side. This is a destructive operation. |
-| `last_write_wins` | Not enforced by replicon — this is an application-level pattern. Set this strategy to document the intent and remind operators. The application must include `updated_at` columns and `ON CONFLICT` clauses. |
-
-replicon records all detected conflicts in a `replicon_conflict_log` table on each node.
-
-## Service Mode
-
-Run as a TLS-protected API:
-
-```bash
-export REPLICON_API_KEY='replace-with-long-random-token'
-replicon serve \
-  -config replicon.json \
-  -listen :8443 \
-  -tls-cert server.crt \
-  -tls-key server.key \
-  -audit-log var/audit/replicon.jsonl
-```
-
-| Endpoint | Method | Auth | Description |
-|----------|--------|------|-------------|
-| `/healthz` | GET | No | Process liveness |
-| `/readyz` | GET | Yes | Config validation |
-| `/metrics` | GET | Yes | Prometheus counters |
-| `/api/v1/validate` | GET/POST | Yes | Validate config |
-| `/api/v1/verify` | GET/POST | Yes | Check replication state |
-| `/api/v1/probe` | GET/POST | Yes | Active replication test |
-| `/api/v1/promote` | POST | Yes | Promote standby (with preflight) |
-| `/api/v1/rejoin` | POST | Yes | Rejoin old primary (with preflight) |
-| `/api/v1/history` | GET | Yes | Recent audit entries |
+1. Each agent tries to acquire a lease row in a coordination PostgreSQL database
+2. The lease holder is the leader — the only agent that can trigger failover
+3. The leader renews the lease every `renew_sec`
+4. If the leader stops renewing, the lease expires after `lease_ttl_sec` and another agent takes over
+5. On graceful shutdown, the leader voluntarily expires its lease
 
 ## Commands
 
@@ -435,20 +180,18 @@ replicon serve -config <file> -tls-cert <cert> -tls-key <key> [-listen :8080]
 replicon version
 ```
 
-## Config Notes
+## Config
 
 - `dsn_env` is the recommended way to provide credentials. `dsn` works but puts connection strings in the config file.
-- Rendered setup snippets use `REPL_PASSWORD` shell variable placeholders.
+- Use `standbys` (array) for clusters, or `standby` (object) for a single standby. Do not use both.
+- Use `logical.nodes` (array) for multi-node logical replication, or `node_a`/`node_b` for two-node.
+- The `.pgpass` file on the old primary is required for `rejoin`. See [deploy/pgpass.example](./deploy/pgpass.example).
 - `probe` writes to `public.replicon_replication_probe` — the DSN user needs CREATE and DML permissions.
-- `promote` and `rejoin` use SSH for remote execution. Run `preflight` first to verify connectivity.
-- Use `standbys` (array) for clusters with multiple standbys, or `standby` (object) for a single standby. Do not use both.
-- Use `logical.nodes` (array) for multi-node logical replication, or `node_a`/`node_b` for two-node setups. The two-node fields are kept for backward compatibility.
-- The `.pgpass` file on the old primary host is required for `rejoin` to authenticate `pg_basebackup` without prompting. See [deploy/pgpass.example](./deploy/pgpass.example).
 
 ## Documentation
 
-- [Linux Installation And Configuration](./docs/linux-setup.md) — complete step-by-step for bare-metal and VM servers
-- [Installation](./docs/installation.md) — build from source, binary install, Docker, systemd
+- [Linux Installation And Configuration](./docs/linux-setup.md)
+- [Installation](./docs/installation.md)
 - [Master-Slave Setup](./docs/master-slave.md)
 - [Master-Master Setup](./docs/master-master.md)
 - [Verification And Probing](./docs/verification.md)
@@ -464,28 +207,19 @@ make test-race         # unit + stress tests with race detector
 make test-integration  # integration tests against live PostgreSQL
 make test-all          # lint + race + integration
 make bench             # allocation benchmarks
-make build             # build binary to bin/replicon
-make docker-build      # build container image
+make build             # build binary with version info
 make package-release   # cross-platform static binaries
 ```
 
-CI: [ci.yml](./.github/workflows/ci.yml) | Release: [release.yml](./.github/workflows/release.yml)
+## Limitations
 
-## Scope and limitations
+- **Leader election uses PostgreSQL row locking, not Raft/Paxos.** It handles agent crashes, network blips, and rolling restarts. It does not provide the formal consensus guarantees of etcd or ZooKeeper. If the coordination database goes down, election stalls until it recovers.
+- **Witness-based failover is not distributed consensus.** Two observers agreeing reduces split-brain risk but does not eliminate it. Both could be on the wrong side of a partition.
+- **Multi-node logical `verify` and `probe` are two-node only.** `ddl-sync` and `conflicts` work across N nodes, but `verify` and `probe` only check `node_a`/`node_b`.
+- **DDL sync is not real-time.** There is a delay between DDL execution and replay. Complex DDL may fail during replay.
+- **Conflict resolution is limited.** `skip` is lossy. `last_write_wins` is an application pattern, not enforced by replicon. PostgreSQL has no hook for custom conflict handlers in logical replication.
+- **Master-master requires write partitioning.** replicon detects and logs conflicts but cannot prevent them.
 
-replicon manages PostgreSQL replication topologies with a single primary (master-slave/cluster) or multiple writable nodes (master-master).
+## License
 
-**What works well:**
-
-- Master-slave with one or more standbys: full lifecycle from setup through failover
-- Automatic failover with fence-then-promote and optional witness node
-- Active replication probing across all standbys in a cluster
-- DDL capture and replay for master-master setups
-
-**Where replicon has limits:**
-
-- **No distributed consensus.** The witness node improves safety when SSH fails, but it is not equivalent to an etcd quorum. For the strongest automatic failover guarantees, use Patroni or Stolon.
-- **Multi-node logical verify/probe not yet implemented.** `ddl-sync` and `conflicts` work across N nodes, but `verify` and `probe` only check the two-node `node_a`/`node_b` pair.
-- **DDL sync is not real-time.** There is a window between DDL execution on one node and replay on others. Complex, data-dependent DDL may fail during replay.
-- **Conflict resolution is limited.** `skip` advances past conflicts (lossy). `last_write_wins` is an application-level pattern that replicon documents but does not enforce. PostgreSQL does not provide a hook for custom conflict handlers in logical replication.
-- **Master-master requires write partitioning.** replicon can detect and log conflicts but cannot prevent them at the database level.
+[MIT](./LICENSE)
