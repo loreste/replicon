@@ -1,154 +1,136 @@
 # replicon
 
-A small Go CLI that helps you prepare and verify PostgreSQL replication between two servers.
+A Go CLI and API for managing PostgreSQL replication — setup, verification, failover, and monitoring across master-slave, cluster, and master-master topologies.
 
 ## Why this exists
 
-PostgreSQL has solid built-in replication. Physical streaming replication and logical replication both work well once configured. The difficulty is everything around the setup and ongoing verification:
+PostgreSQL replication works well once configured. The problem is getting there and staying confident it's working.
 
-**Setting up replication is manual and error-prone.** Getting a primary-standby pair running requires editing `postgresql.conf`, `pg_hba.conf`, creating replication roles and slots, running `pg_basebackup` with the right flags, and configuring recovery parameters on the standby. Each step depends on the previous one being correct. A typo in a CIDR block or a missing `pg_hba.conf` entry means replication silently fails to connect. For logical replication (master-master), the surface area doubles: both nodes need matching configuration, publications, cross-subscriptions, and the `origin = none` flag to prevent infinite loops. There is no built-in tool that validates the whole chain before you start.
+**Setup is manual and error-prone.** A primary-standby pair requires coordinated changes across `postgresql.conf`, `pg_hba.conf`, replication roles, replication slots, `pg_basebackup`, and recovery parameters. Each step depends on the previous one being correct, and mistakes fail silently — a wrong CIDR block means the standby just never connects. For logical replication the surface area doubles: both nodes need matching schemas, publications, cross-subscriptions, and the `origin = none` flag to prevent infinite loops.
 
-**There is no built-in way to confirm replication is actually working.** `pg_stat_replication` tells you a standby is connected, but not that data is flowing. A subscription can show `streaming` in `pg_stat_subscription` while the apply worker is silently stuck. The only way to be sure is to write data on one side and confirm it appears on the other. PostgreSQL does not provide a command for this.
+**There is no built-in way to confirm data is actually flowing.** `pg_stat_replication` shows a connection exists. It does not prove rows are replicating. A subscription can show `streaming` in `pg_stat_subscription` while the apply worker is stuck. The only proof is writing data on one side and confirming it appears on the other.
 
-**Failover is a series of manual steps with real consequences.** Promoting a standby is straightforward (`pg_promote()`), but the steps around it — fencing the old primary, rebuilding it as a standby, creating a new replication slot — are easy to get wrong under pressure. Getting the order wrong can cause split-brain or data loss.
+**Failover under pressure is where mistakes happen.** `pg_promote()` is simple, but the steps around it — fencing the old primary, choosing the best standby in a cluster, rebuilding the old primary as a standby — are easy to get wrong when you're in an incident.
 
-**Configuration is scattered and not version-controlled.** Replication settings live across `postgresql.conf`, `pg_hba.conf`, replication slots, and recovery parameters. There is no single source of truth for what the intended topology looks like, which makes auditing and reproducing setups difficult.
+**Configuration is scattered.** Replication settings live across multiple files and PostgreSQL catalog tables. There is no single source of truth for what the topology should look like.
 
-### What already exists
+### How replicon compares
 
-There are good tools in this space, but they solve different problems:
+| Tool | What it does | When to use it instead of replicon |
+|------|-------------|-------------------------------------|
+| **Patroni** / **Stolon** | Full HA orchestrators with leader election via etcd/ZooKeeper/Consul. Manage the entire PostgreSQL lifecycle. | You need consensus-based automatic failover across large clusters and are willing to run a DCS. |
+| **repmgr** | Replication manager with witness nodes and daemon-based monitoring. | You want a mature, well-documented replication manager with its own daemon process. |
+| **pg_basebackup** | Low-level PostgreSQL tool for creating base backups. | You only need the backup step and will script everything else yourself. |
+| **pgBackRest** / **Barman** | Backup and point-in-time recovery. | Your focus is backup management, not replication topology. |
 
-- **Patroni** / **Stolon** / **repmgr** are full HA orchestrators that manage automatic failover, leader election, and cluster state via DCS (etcd, ZooKeeper, Consul). They are the right choice when you need automated failover for multi-node clusters. They are also complex to deploy and operate, and they take ownership of your PostgreSQL lifecycle.
-- **pg_basebackup** and the PostgreSQL replication protocol are the underlying mechanisms. They work, but they are low-level building blocks, not end-to-end workflows.
-- **pgBackRest** / **Barman** focus on backup and recovery, not replication topology management.
+replicon fills a different space. It is a single static binary that:
 
-replicon does not compete with any of these. It is not an HA orchestrator. It does not manage leader election, does not run as a daemon watching your cluster, and does not take ownership of your PostgreSQL process. It is a configuration and verification tool for teams that:
+- defines your topology in one version-controlled JSON file
+- validates the configuration before you touch any server
+- renders the exact `postgresql.conf`, `pg_hba.conf`, and SQL you need to apply
+- verifies replication is active by querying PostgreSQL system views
+- proves data is flowing with an active write/read/delete probe
+- manages failover with dry-run first, execute when ready
+- automatically fails over with fence-then-promote safety when configured
+- selects the best standby for promotion in multi-standby clusters
+- exposes a TLS API with audit logging and Prometheus metrics for service mode
 
-- manage two-node replication setups (one primary and one standby, or two writable nodes with logical replication)
-- want to define the intended topology in a single JSON file that can be version-controlled
-- want to validate the configuration before touching the servers
-- want a real end-to-end test that data is actually replicating, not just that connections are open
-- want scripted failover steps that can be dry-run first and audited after execution
-- do not need or want the operational overhead of a full HA framework
+It does not require etcd, ZooKeeper, Consul, or any external dependency beyond PostgreSQL and SSH.
 
-### What replicon actually does
+## What replicon supports
 
-It gives you a repeatable way to:
-
-- keep the topology in one JSON file
-- validate the replication plan before touching either server
-- render the primary and standby configuration snippets you need
-- generate the `pg_basebackup` bootstrap command for the standby
-- verify that replication is actually active by querying PostgreSQL system views
-- run an active write/read/delete probe across the configured replication path
-- dry-run failover commands before executing them over SSH
-- audit every operation in a JSONL log
+| Capability | Status |
+|------------|--------|
+| Master-slave (1 primary + 1 standby) | Tested on PG 13, 14, 16 |
+| Cluster (1 primary + N standbys) | Tested on PG 16; best-standby promotion by WAL position |
+| Master-master (2 writable nodes, logical replication) | Tested on PG 16; bidirectional probe confirmed |
+| Configuration validation | JSON schema checks, DSN parsing, CIDR validation, node uniqueness |
+| Setup rendering | Generates `postgresql.conf`, `pg_hba.conf`, SQL, and `pg_basebackup` commands |
+| Read-only verification | Queries `pg_stat_replication`, `pg_stat_subscription`, standby recovery state |
+| Active end-to-end probe | Writes a row, waits for replication, deletes it, confirms deletion replicates |
+| Manual failover (dry-run + execute) | `promote` and `rejoin` with SSH execution and preflight checks |
+| Automatic failover | `watch` command: health monitoring, fence-then-promote, split-brain prevention |
+| Cluster-aware promotion | Queries all standbys' WAL receive LSN, promotes the most up-to-date one |
+| TLS admin API | `/verify`, `/probe`, `/promote`, `/rejoin`, `/metrics`, `/history` endpoints |
+| Prometheus metrics | Command run counts and durations, scrapeable at `/metrics` |
+| Audit logging | Every operation recorded in append-only JSONL with credential redaction |
+| SSH preflight | Validates SSH connectivity to all nodes before destructive operations |
+| Cross-platform | Static binaries for linux/amd64, linux/arm64, darwin/amd64, darwin/arm64 |
+| No runtime dependencies | Single binary. No etcd, no ZooKeeper, no Consul, no agent on the PG servers. |
 
 ### What replicon does not do
 
-- Automatic failover beyond two nodes (two-node fence-then-promote is supported via `watch`)
-- Cluster management beyond two nodes
-- Continuous monitoring or alerting (though it exposes Prometheus metrics in service mode)
-- DDL replication for master-master (a PostgreSQL limitation, not ours)
-- Conflict resolution for master-master writes (the application must handle this)
+- **Leader election via distributed consensus.** The `watch` command uses fence-then-promote: it stops the old primary via SSH before promoting. If it cannot fence (SSH also fails), it does not promote, to prevent split-brain. This is a deliberate trade-off — it avoids the complexity of a DCS at the cost of not promoting during certain network partitions.
+- **DDL replication for master-master.** This is a PostgreSQL limitation. Schemas and tables must exist on both nodes before data can flow.
+- **Conflict resolution for master-master writes.** The application must partition writes (by region, tenant, or dataset) to avoid conflicts.
 
-## Tested Support
+## Architecture
 
-PostgreSQL versions tested:
-
-| Version | Mode | Status |
-|---------|------|--------|
-| PostgreSQL 13 | master-slave | integration tests, verify, probe all pass |
-| PostgreSQL 14 | master-slave | integration tests, verify, probe all pass |
-| PostgreSQL 16 | master-slave | integration tests, verify, probe all pass |
-| PostgreSQL 16 | master-slave (cluster) | verify, probe, best-standby promotion all pass |
-| PostgreSQL 16 | master-master | verify, probe, bidirectional replication all pass |
-
-replicon works the same way whether PostgreSQL is running in Docker, on bare-metal servers, or on cloud VMs. It connects over standard DSNs and uses SSH for remote operations — there is no Docker dependency at runtime.
-
-The included Docker integration environment starts a real `master-slave` primary and standby. In that environment we tested streaming status, the active `probe`, and replication of a temporary database containing schemas, tables, rows, indexes, a sequence, a view, and a function from primary to standby. Multi-version compose files are provided for PG 13 and PG 14 testing.
-
-For `master-master`, we tested `validate`, `plan`, `render -target node-a`, `render -target node-b`, `verify`, bidirectional row replication on a pre-created table, and the active two-way `probe` with disposable Docker containers. PostgreSQL logical replication does not automatically replicate databases or DDL; databases, schemas, and tables must exist on both nodes before table data can replicate.
-
-`verify` is read-only. It checks PostgreSQL replication state views.
-
-`probe` is active. It creates `public.replicon_replication_probe`, writes a sentinel row, waits for replication, deletes the row, and confirms the delete also replicates.
-
-`serve` exposes a TLS-protected admin API with API-key authentication, audit logging, and Prometheus-style metrics.
-
-`promote` and `rejoin` provide manual failover operations for `master-slave`, with dry-run output by default and SSH execution when `-execute` is set.
-
-`watch` runs an automatic failover watchdog that monitors the primary and promotes the standby when the primary is unreachable. It uses a fence-then-promote model: it stops PostgreSQL on the old primary via SSH before promoting the standby, and refuses to promote if fencing fails (to prevent split-brain).
-
-## Intended Architecture
-
-Master/slave:
+Master-slave / cluster:
 
 ```mermaid
 flowchart LR
-    A[replicon CLI] --> B[Primary PostgreSQL]
-    A --> C[Standby PostgreSQL]
-    B -->|Physical streaming replication / WAL| C
-    A -->|verify| D[pg_stat_replication]
-    A -->|verify| E[Standby recovery and replay state]
+    A[replicon] --> B[Primary]
+    A --> C[Standby 1]
+    A --> D[Standby 2]
+    A --> E[Standby N]
+    B -->|WAL streaming| C
+    B -->|WAL streaming| D
+    B -->|WAL streaming| E
+    A -->|verify| F[pg_stat_replication]
     A -->|probe write| B
     A -->|probe read| C
+    A -->|probe read| D
+    A -->|watch| G[health check → fence → promote best]
 ```
 
-Master/master:
+Master-master:
 
 ```mermaid
 flowchart LR
-    A[replicon CLI] --> B[Node A PostgreSQL]
-    A --> C[Node B PostgreSQL]
-    B -->|Logical publication / subscription| C
-    C -->|Logical publication / subscription| B
-    A -->|verify| D[pg_stat_subscription on node A]
-    A -->|verify| E[pg_stat_subscription on node B]
+    A[replicon] --> B[Node A]
+    A --> C[Node B]
+    B -->|Logical pub/sub| C
+    C -->|Logical pub/sub| B
+    A -->|verify| D[pg_stat_subscription]
     A -->|probe write/read/delete| B
     A -->|probe write/read/delete| C
 ```
 
-## Modes
-
-replicon supports three topologies:
-
-- **master-slave** — one writable primary, one read-only standby. The simplest setup.
-- **master-slave (cluster)** — one writable primary, multiple read-only standbys. Use the `standbys` array instead of the single `standby` field. Promotion picks the standby with the least replication lag.
-- **master-master** — two writable nodes with logical bidirectional replication. Requires the application to prevent conflicting writes.
-
 ## Quick Start
 
-Master/slave:
+### Master-slave
 
 ```bash
 export REPLICON_PRIMARY_DSN='postgres://postgres:secret@10.0.0.10:5432/postgres?sslmode=require'
 export REPLICON_STANDBY_DSN='postgres://postgres:secret@10.0.0.11:5432/postgres?sslmode=require'
-go run . init -mode master-slave > replicon.json
-go run . validate -config replicon.json
-go run . plan -config replicon.json
-go run . render -config replicon.json -target primary
-go run . render -config replicon.json -target standby
-go run . verify -config replicon.json
-go run . probe -config replicon.json
-go run . promote -config replicon.json
-go run . rejoin -config replicon.json
+
+replicon init -mode master-slave > replicon.json
+replicon validate -config replicon.json
+replicon plan -config replicon.json
+replicon render -config replicon.json -target primary
+replicon render -config replicon.json -target standby
+replicon verify -config replicon.json
+replicon probe -config replicon.json
 ```
 
-Master/master:
+### Master-master
 
 ```bash
 export REPLICON_NODE_A_DSN='postgres://postgres:secret@10.0.0.10:5432/appdb?sslmode=require'
 export REPLICON_NODE_B_DSN='postgres://postgres:secret@10.0.0.11:5432/appdb?sslmode=require'
-go run . init -mode master-master > replicon-mm.json
-go run . validate -config replicon-mm.json
-go run . render -config replicon-mm.json -target node-a
-go run . render -config replicon-mm.json -target node-b
-go run . verify -config replicon-mm.json
-go run . probe -config replicon-mm.json
+
+replicon init -mode master-master > replicon-mm.json
+replicon validate -config replicon-mm.json
+replicon render -config replicon-mm.json -target node-a
+replicon render -config replicon-mm.json -target node-b
+replicon verify -config replicon-mm.json
+replicon probe -config replicon-mm.json
 ```
 
-Cluster (multiple standbys):
+### Cluster (multiple standbys)
+
+Use the `standbys` array instead of the single `standby` field:
 
 ```json
 {
@@ -195,64 +177,24 @@ Cluster (multiple standbys):
 }
 ```
 
-`verify` and `probe` check all standbys. `promote` queries each standby's WAL receive position and promotes the one closest to the primary. Use `standbys` (array) instead of `standby` (single object) — do not use both.
+`verify` and `probe` check all standbys. `promote` queries each standby's WAL receive position and promotes the one closest to the primary. Do not use both `standby` and `standbys`.
 
-## Commands
+## Failover
 
-- `go run . init -mode master-slave`
-- `go run . init -mode master-master`
-- `go run . validate -config <file>`
-- `go run . plan -config <file>`
-- `go run . render -config <file> -target primary`
-- `go run . render -config <file> -target standby`
-- `go run . render -config <file> -target node-a`
-- `go run . render -config <file> -target node-b`
-- `go run . verify -config <file> [-output text|json] [-audit-log path]`
-- `go run . probe -config <file> [-output text|json] [-audit-log path]`
-- `go run . promote -config <file> [-execute] [-output text|json] [-audit-log path]`
-- `go run . rejoin -config <file> [-execute] [-output text|json] [-audit-log path]`
-- `go run . watch -config <file> [-audit-log path]`
-- `go run . history [-audit-log path] [-limit 20] [-output text|json]`
-- `go run . serve -config <file> -tls-cert server.crt -tls-key server.key`
-
-## Config Notes
-
-- `mode` chooses the replication model.
-- `dsn_env` is the preferred production path for node credentials.
-- `dsn` still works, but it keeps database connection material in the config file.
-- Rendered setup snippets use `REPL_PASSWORD` shell variable placeholders — secrets should be stored outside of the config file (e.g. in environment variables or a secrets manager).
-- `probe` writes into `public.replicon_replication_probe`, so the configured DSN user must be able to create and modify that table.
-- `serve` requires `REPLICON_API_KEY` by default, plus TLS certificate and key files.
-- `promote` and `rejoin` use the local `ssh` binary for remote execution when `-execute` is set.
-
-## Failover Operations
-
-Plan the workflow without touching the servers:
+### Manual (dry-run first)
 
 ```bash
-go run . promote -config replicon.json
-go run . rejoin -config replicon.json
+replicon promote -config replicon.json           # shows what would happen
+replicon promote -config replicon.json -execute   # runs it over SSH
+replicon rejoin -config replicon.json -execute    # rebuilds old primary as standby
 ```
 
-Execute over SSH:
-
-```bash
-go run . promote -config replicon.json -execute
-go run . rejoin -config replicon.json -execute
-```
-
-`promote` makes the configured standby writable.
-
-`rejoin` preserves the old primary data directory under a timestamped backup path, rebuilds it from the new primary, and starts it back as a standby.
-
-## Automatic Failover
+### Automatic
 
 Add a `failover` section to your config:
 
 ```json
 {
-  "cluster_name": "orders-prod",
-  "mode": "master-slave",
   "failover": {
     "enabled": true,
     "check_interval_sec": 5,
@@ -268,44 +210,35 @@ Add a `failover` section to your config:
 Start the watchdog:
 
 ```bash
-go run . watch -config replicon.json -audit-log var/audit/replicon.jsonl
+replicon watch -config replicon.json -audit-log var/audit/replicon.jsonl
 ```
 
-How it works:
+The watchdog:
 
-1. Checks primary health every `check_interval_sec` seconds via a SQL connection.
-2. After `max_failures` consecutive failures, fences the primary via SSH (`fence_command`).
-3. If fencing succeeds, promotes the standby.
-4. If fencing fails (e.g. network partition), does **not** promote — to prevent split-brain.
-5. Optionally runs `post_promote_command` on the new primary (e.g. update DNS).
+1. Checks primary health every `check_interval_sec` via SQL connection
+2. After `max_failures` consecutive failures, fences the primary via SSH
+3. If fencing succeeds, promotes the best standby (by WAL position in cluster mode)
+4. If fencing fails, does **not** promote — prevents split-brain
+5. Optionally runs `post_promote_command` on the new primary
 
-The watchdog runs preflight and verify checks before entering the monitoring loop. All fence and promote events are recorded in the audit log.
+All events are recorded in the audit log.
 
 | Field | Default | Description |
 |-------|---------|-------------|
 | `check_interval_sec` | 5 | Seconds between health checks |
-| `health_timeout_sec` | 3 | Timeout for each health check connection |
-| `max_failures` | 3 | Consecutive failures before triggering failover |
+| `health_timeout_sec` | 3 | Timeout for each SQL health check |
+| `max_failures` | 3 | Consecutive failures before failover |
 | `fence_timeout_sec` | 10 | Timeout for the SSH fence command |
 | `fence_command` | `sudo systemctl stop postgresql` | Command to stop PostgreSQL on the primary |
-| `post_promote_command` | (none) | Optional command to run on the new primary after promotion |
-
-## Audit History
-
-Read recent audit entries from the JSONL audit log:
-
-```bash
-go run . history -audit-log var/audit/replicon.jsonl -limit 20
-go run . history -audit-log var/audit/replicon.jsonl -output json
-```
+| `post_promote_command` | _(none)_ | Optional command on new primary after promotion |
 
 ## Service Mode
 
-Start the admin API:
+Run as a TLS-protected API:
 
 ```bash
 export REPLICON_API_KEY='replace-with-long-random-token'
-go run . serve \
+replicon serve \
   -config replicon.json \
   -listen :8443 \
   -tls-cert server.crt \
@@ -313,42 +246,49 @@ go run . serve \
   -audit-log var/audit/replicon.jsonl
 ```
 
-Example API calls:
+Endpoints:
 
-```bash
-curl -s \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/healthz
+| Endpoint | Method | Auth | Description |
+|----------|--------|------|-------------|
+| `/healthz` | GET | No | Process liveness |
+| `/readyz` | GET | Yes | Config validation |
+| `/metrics` | GET | Yes | Prometheus counters |
+| `/api/v1/validate` | GET/POST | Yes | Validate config |
+| `/api/v1/verify` | GET/POST | Yes | Check replication state |
+| `/api/v1/probe` | GET/POST | Yes | Active replication test |
+| `/api/v1/promote` | POST | Yes | Promote standby (with preflight) |
+| `/api/v1/rejoin` | POST | Yes | Rejoin old primary (with preflight) |
+| `/api/v1/history` | GET | Yes | Recent audit entries |
 
-curl -s \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/readyz
+## Commands
 
-curl -s \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/api/v1/verify
-
-curl -s \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  'https://127.0.0.1:8443/api/v1/history?limit=10'
-
-curl -s -X POST \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/api/v1/promote
-
-curl -s -X POST \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/api/v1/rejoin
-
-curl -s \
-  -H 'X-API-Key: replace-with-long-random-token' \
-  https://127.0.0.1:8443/metrics
+```
+replicon init [-mode master-slave|master-master]
+replicon validate -config <file> [-output text|json] [-audit-log path]
+replicon plan -config <file>
+replicon render -config <file> -target <primary|standby|node-a|node-b>
+replicon verify -config <file> [-output text|json] [-audit-log path]
+replicon probe -config <file> [-output text|json] [-audit-log path]
+replicon promote -config <file> [-execute] [-skip-preflight] [-output text|json]
+replicon rejoin -config <file> [-execute] [-skip-preflight] [-output text|json]
+replicon preflight -config <file> [-output text|json]
+replicon watch -config <file> [-audit-log path]
+replicon history [-audit-log path] [-limit 20] [-output text|json]
+replicon serve -config <file> -tls-cert <cert> -tls-key <key> [-listen :8080]
 ```
 
-## How-To Docs
+## Config Notes
 
-- [Linux Installation And Configuration](./docs/linux-setup.md) — complete step-by-step guide for bare-metal and VM servers
-- [Installation](./docs/installation.md)
+- `dsn_env` is the recommended way to provide credentials. `dsn` works but puts connection strings in the config file.
+- Rendered setup snippets use `REPL_PASSWORD` shell variable placeholders.
+- `probe` writes to `public.replicon_replication_probe` — the DSN user needs CREATE and DML permissions.
+- `promote` and `rejoin` use SSH for remote execution. Run `preflight` first to verify connectivity.
+- Use `standbys` (array) for clusters with multiple standbys, or `standby` (object) for a single standby. Do not use both.
+
+## Documentation
+
+- [Linux Installation And Configuration](./docs/linux-setup.md) — complete step-by-step for bare-metal and VM servers
+- [Installation](./docs/installation.md) — build from source, binary install, Docker, systemd
 - [Master-Slave Setup](./docs/master-slave.md)
 - [Master-Master Setup](./docs/master-master.md)
 - [Verification And Probing](./docs/verification.md)
@@ -356,44 +296,24 @@ curl -s \
 - [Deployment](./docs/deployment.md)
 - [Integration Environment](./integration/README.md)
 
-## Automation
-
-Local automation:
+## Development
 
 ```bash
-make test
-make build
-make docker-build
-make package-release
+make test           # unit tests
+make test-race      # unit + stress tests with race detector
+make test-integration  # integration tests against live PostgreSQL
+make test-all       # lint + race + integration
+make bench          # allocation benchmarks
+make build          # build binary to bin/replicon
+make docker-build   # build container image
+make package-release # cross-platform static binaries
 ```
 
-CI:
+CI: [ci.yml](./.github/workflows/ci.yml) | Release: [release.yml](./.github/workflows/release.yml)
 
-- GitHub Actions workflow: [ci.yml](./.github/workflows/ci.yml)
-- GitHub Actions release workflow: [release.yml](./.github/workflows/release.yml)
+## Limitations
 
-## Release Assets
-
-- sample configs: [config/master-slave.example.json](./config/master-slave.example.json), [config/master-master.example.json](./config/master-master.example.json)
-- local cross-platform packaging: [scripts/package-release.sh](./scripts/package-release.sh)
-
-## Example
-
-```bash
-go run . init > replicon.json
-go run . validate -config replicon.json
-go run . render -config replicon.json -target primary
-go run . render -config replicon.json -target standby
-go run . verify -config replicon.json -output json
-go run . probe -config replicon.json -audit-log var/audit/replicon.jsonl
-go run . promote -config replicon.json
-go run . history -audit-log var/audit/replicon.jsonl
-```
-
-## Scope and limitations
-
-replicon handles one primary with one or more standbys (master-slave), or two writable nodes with bidirectional logical replication (master-master). Cluster mode (multiple standbys) is supported by using the `standbys` array in the config. Automatic failover is available via `watch` for master-slave setups. It does not manage leader election via distributed consensus or orchestrate clusters beyond a single primary. If you need multi-primary or consensus-based HA, use Patroni or a similar orchestrator.
-
-For `master-master`: PostgreSQL logical replication does not make conflicting writes safe. You still need a write ownership strategy in the application (region-based, tenant-based, or dataset partitioning). Logical replication also does not replicate DDL — schemas and tables must exist on both nodes before data can flow.
-
-Docker Compose stacks are provided for both `master-slave` (including PG 13, 14, and 16) and `master-master`.
+- Automatic failover uses fence-then-promote, not distributed consensus. If SSH to the primary also fails during an outage, the watchdog will not promote. This prevents split-brain but means some failure scenarios require manual intervention.
+- Master-master logical replication does not replicate DDL. Schemas and tables must exist on both nodes.
+- Master-master does not resolve write conflicts. The application must partition writes to avoid conflicts.
+- replicon manages a single primary. It does not support multi-primary setups beyond two-node logical replication.
