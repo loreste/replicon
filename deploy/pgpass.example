@@ -1,0 +1,14 @@
+# .pgpass file for replicon failover operations
+# Place this at ~/.pgpass on the old primary host so that pg_basebackup
+# can authenticate to the new primary during rejoin without prompting.
+#
+# Format: hostname:port:database:username:password
+# Permissions must be 0600: chmod 600 ~/.pgpass
+#
+# Example for rejoin (old primary connecting to new primary for pg_basebackup):
+10.0.0.11:5432:*:replicator:your-secure-password
+
+# If using a cluster with multiple standbys, add an entry for each potential
+# new primary:
+# 10.0.0.11:5432:*:replicator:your-secure-password
+# 10.0.0.12:5432:*:replicator:your-secure-password

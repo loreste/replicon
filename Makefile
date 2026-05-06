@@ -3,6 +3,10 @@ GOMODCACHE ?= /tmp/replicon-gomodcache
 GO_ENV = GOCACHE=$(GOCACHE) GOMODCACHE=$(GOMODCACHE)
 BIN ?= bin/replicon
 IMAGE ?= replicon:local
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
+COMMIT ?= $(shell git rev-parse --short HEAD 2>/dev/null || echo none)
+DATE ?= $(shell date -u +%Y-%m-%dT%H:%M:%SZ)
+LDFLAGS = -s -w -X main.version=$(VERSION) -X main.commit=$(COMMIT) -X main.date=$(DATE)
 
 .PHONY: test test-race test-integration test-all bench lint build fmt tidy docker-build package-release clean
 
@@ -30,7 +34,7 @@ lint:
 
 build:
 	mkdir -p bin
-	$(GO_ENV) go build -o $(BIN) .
+	$(GO_ENV) go build -trimpath -ldflags='$(LDFLAGS)' -o $(BIN) .
 
 fmt:
 	gofmt -w main.go $$(find internal -name '*.go' | sort)

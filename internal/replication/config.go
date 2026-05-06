@@ -129,6 +129,15 @@ func SampleConfig(mode string) (string, error) {
   "network": {
     "replication_cidr": "10.0.0.11/32",
     "application_name": "orders-prod-standby"
+  },
+  "failover": {
+    "enabled": false,
+    "check_interval_sec": 5,
+    "health_timeout_sec": 3,
+    "max_failures": 3,
+    "fence_timeout_sec": 10,
+    "fence_command": "sudo systemctl stop postgresql",
+    "post_promote_command": ""
   }
 }
 `, nil

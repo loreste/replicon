@@ -2,6 +2,13 @@
 
 This mode is intended for PostgreSQL logical bidirectional replication between two writable nodes.
 
+Logical replication works at the row level within a single database. Unlike physical replication (master-slave), it does **not** replicate the entire PostgreSQL instance. You must:
+
+- Create the target database on both nodes manually
+- Create matching schemas and tables on both nodes manually (DDL is not replicated)
+- Explicitly publish the tables you want replicated
+- Manage new table additions by refreshing subscriptions
+
 Current test status: we tested `validate`, `plan`, both render targets, `verify`, direct bidirectional row replication, and `probe` with two disposable PostgreSQL 16 Docker containers.
 
 ## When To Use It

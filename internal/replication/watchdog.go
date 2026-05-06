@@ -25,6 +25,7 @@ type WatchdogEvent struct {
 // coupling the watchdog to a specific output mechanism.
 type WatchdogCallbacks struct {
 	OnEvent func(WatchdogEvent)
+	DryRun  bool // monitor and log without executing fence or promote
 }
 
 // WatchdogDefaults fills in zero-valued failover config fields with safe
@@ -123,6 +124,19 @@ func RunWatchdog(ctx context.Context, cfg Config, service *Service, cb WatchdogC
 		})
 
 		if consecutiveFailures < f.MaxFailures {
+			continue
+		}
+
+		if cb.DryRun {
+			emit(WatchdogEvent{
+				Time:        time.Now().UTC(),
+				Type:        "promote",
+				Message:     fmt.Sprintf("dry-run: would fence %s and promote best standby (%d/%d failures reached)", cfg.Primary.Name, consecutiveFailures, f.MaxFailures),
+				Failures:    consecutiveFailures,
+				MaxFailures: f.MaxFailures,
+			})
+			// Reset counter so dry-run keeps monitoring.
+			consecutiveFailures = 0
 			continue
 		}
 

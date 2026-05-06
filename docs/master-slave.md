@@ -2,6 +2,8 @@
 
 This mode builds native PostgreSQL physical streaming replication between one primary and one standby.
 
+Physical replication works at the WAL (write-ahead log) level. The standby receives and replays raw WAL records from the primary, which means **everything is replicated**: all databases, schemas, tables, indexes, sequences, views, functions, and roles on the primary are replicated to the standby. There is no need to select individual databases or tables — the standby is a full copy of the primary.
+
 ## When To Use It
 
 Use `master-slave` when you want:
@@ -9,6 +11,7 @@ Use `master-slave` when you want:
 - one writable node
 - one replica for failover or read-only access
 - the simplest operational model for two servers
+- all databases on the instance replicated automatically
 
 ## 1. Create The Config
 

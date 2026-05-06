@@ -17,6 +17,12 @@ import (
 	"replicon/internal/replication"
 )
 
+var (
+	version = "dev"
+	commit  = "none"
+	date    = "unknown"
+)
+
 func main() {
 	if err := run(os.Args[1:], os.Stdout, os.Stderr); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
@@ -55,6 +61,9 @@ func run(args []string, stdout, stderr io.Writer) error {
 		return runHistory(args[1:], stdout)
 	case "serve":
 		return runServe(args[1:], stdout)
+	case "version", "-v", "--version":
+		fmt.Fprintf(stdout, "replicon %s (commit %s, built %s)\n", version, commit, date)
+		return nil
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return nil
@@ -373,6 +382,7 @@ func runWatch(args []string, stdout io.Writer) error {
 	fs := flag.NewFlagSet("watch", flag.ContinueOnError)
 	configPath := fs.String("config", "", "path to JSON configuration")
 	auditLog := fs.String("audit-log", "", "path to JSONL audit log")
+	dryRun := fs.Bool("dry-run", false, "monitor and log events without executing failover")
 	fs.SetOutput(io.Discard)
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -389,12 +399,18 @@ func runWatch(args []string, stdout io.Writer) error {
 		return fmt.Errorf("failover.enabled is not set in config — add a failover section to enable automatic failover")
 	}
 
-	// Pre-validate SSH before entering the watch loop.
-	fmt.Fprintln(stdout, "running SSH preflight check...")
-	if _, err := replication.CheckSSHConnectivity(cfg, 0); err != nil {
-		return fmt.Errorf("preflight check failed: %w", err)
+	if *dryRun {
+		fmt.Fprintln(stdout, "dry-run mode: will monitor and log but will NOT fence or promote")
 	}
-	fmt.Fprintln(stdout, "SSH preflight: PASS")
+
+	// Pre-validate SSH before entering the watch loop (skip in dry-run).
+	if !*dryRun {
+		fmt.Fprintln(stdout, "running SSH preflight check...")
+		if _, err := replication.CheckSSHConnectivity(cfg, 0); err != nil {
+			return fmt.Errorf("preflight check failed: %w", err)
+		}
+		fmt.Fprintln(stdout, "SSH preflight: PASS")
+	}
 
 	// Pre-validate primary connectivity.
 	fmt.Fprintln(stdout, "verifying primary is reachable...")
@@ -406,8 +422,14 @@ func runWatch(args []string, stdout io.Writer) error {
 	service := replication.NewService(*auditLog)
 	f := replication.WatchdogDefaults(cfg.Failover)
 
-	fmt.Fprintf(stdout, "watchdog active: cluster=%s primary=%s standby=%s interval=%ds threshold=%d\n",
-		cfg.ClusterName, cfg.Primary.Name, cfg.Standby.Name, f.CheckIntervalSec, f.MaxFailures)
+	standbys := cfg.ResolveStandbys()
+	standbyNames := make([]string, len(standbys))
+	for i, s := range standbys {
+		standbyNames[i] = s.Name
+	}
+
+	fmt.Fprintf(stdout, "watchdog active: cluster=%s primary=%s standbys=[%s] interval=%ds threshold=%d dry-run=%t\n",
+		cfg.ClusterName, cfg.Primary.Name, strings.Join(standbyNames, ", "), f.CheckIntervalSec, f.MaxFailures, *dryRun)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -425,6 +447,7 @@ func runWatch(args []string, stdout io.Writer) error {
 		OnEvent: func(e replication.WatchdogEvent) {
 			fmt.Fprintf(stdout, "%s [%s] %s\n", e.Time.Format(time.RFC3339), e.Type, e.Message)
 		},
+		DryRun: *dryRun,
 	}
 
 	err = replication.RunWatchdog(ctx, cfg, service, callbacks)
@@ -551,9 +574,10 @@ Usage:
   replicon promote -config replicon.json [-execute] [-skip-preflight] [-output text|json] [-audit-log path]
   replicon rejoin -config replicon.json [-execute] [-skip-preflight] [-output text|json] [-audit-log path]
   replicon preflight -config replicon.json [-output text|json]
-  replicon watch -config replicon.json [-audit-log path]
+  replicon watch -config replicon.json [-audit-log path] [-dry-run]
   replicon history [-audit-log path] [-limit 20] [-output text|json]
-  replicon serve -config replicon.json -tls-cert server.crt -tls-key server.key [-listen :8080] [-audit-log path]`)
+  replicon serve -config replicon.json -tls-cert server.crt -tls-key server.key [-listen :8080] [-audit-log path]
+  replicon version`)
 }
 
 func writeResult(w io.Writer, result replication.CommandResult, output string, err error) error {

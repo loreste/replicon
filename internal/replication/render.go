@@ -11,21 +11,36 @@ func RenderPlan(cfg Config) string {
 	fmt.Fprintf(&b, "Cluster: %s\n", cfg.ClusterName)
 	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
 	case "master-slave":
-		fmt.Fprintf(&b, "Topology: %s (%s:%d) -> %s (%s:%d)\n\n",
-			cfg.Primary.Name, cfg.Primary.Host, cfg.Primary.Port,
-			cfg.Standby.Name, cfg.Standby.Host, cfg.Standby.Port,
-		)
-		b.WriteString("Replication strategy: physical streaming replication with one hot standby.\n\n")
+		standbys := cfg.ResolveStandbys()
+		if len(standbys) == 1 {
+			fmt.Fprintf(&b, "Topology: %s (%s:%d) -> %s (%s:%d)\n\n",
+				cfg.Primary.Name, cfg.Primary.Host, cfg.Primary.Port,
+				standbys[0].Name, standbys[0].Host, standbys[0].Port,
+			)
+			b.WriteString("Replication strategy: physical streaming replication with one hot standby.\n\n")
+		} else {
+			fmt.Fprintf(&b, "Topology: %s (%s:%d) -> [", cfg.Primary.Name, cfg.Primary.Host, cfg.Primary.Port)
+			for i, s := range standbys {
+				if i > 0 {
+					b.WriteString(", ")
+				}
+				fmt.Fprintf(&b, "%s (%s:%d)", s.Name, s.Host, s.Port)
+			}
+			b.WriteString("]\n\n")
+			fmt.Fprintf(&b, "Replication strategy: physical streaming replication with %d hot standbys.\n\n", len(standbys))
+		}
 		b.WriteString("Execution order:\n")
 		b.WriteString("1. Apply the primary configuration snippet and reload PostgreSQL.\n")
 		b.WriteString("2. Create the replication role and physical replication slot on the primary.\n")
-		b.WriteString("3. Stop PostgreSQL on the standby and clear the standby data directory.\n")
-		b.WriteString("4. Run pg_basebackup from the standby against the primary.\n")
-		b.WriteString("5. Start PostgreSQL on the standby and verify pg_stat_replication on the primary.\n")
-		b.WriteString("6. Run replicon verify -config replicon.json to confirm the standby is replaying WAL.\n\n")
+		b.WriteString("3. Stop PostgreSQL on each standby and clear the data directory.\n")
+		b.WriteString("4. Run pg_basebackup from each standby against the primary.\n")
+		b.WriteString("5. Start PostgreSQL on each standby and verify pg_stat_replication on the primary.\n")
+		b.WriteString("6. Run replicon verify -config replicon.json to confirm all standbys are replaying WAL.\n\n")
 		b.WriteString("Rendered assets available:\n")
 		b.WriteString("- replicon render -target primary\n")
-		b.WriteString("- replicon render -target standby\n")
+		for _, s := range standbys {
+			fmt.Fprintf(&b, "- replicon render -target %s\n", s.Name)
+		}
 	case "master-master":
 		fmt.Fprintf(&b, "Topology: %s (%s:%d) <-> %s (%s:%d)\n\n",
 			cfg.NodeA.Name, cfg.NodeA.Host, cfg.NodeA.Port,
@@ -50,11 +65,18 @@ func RenderPlan(cfg Config) string {
 func RenderTarget(cfg Config, target string) (string, error) {
 	switch strings.ToLower(strings.TrimSpace(cfg.Mode)) {
 	case "master-slave":
-		switch strings.ToLower(strings.TrimSpace(target)) {
-		case "primary":
+		targetLower := strings.ToLower(strings.TrimSpace(target))
+		if targetLower == "primary" {
 			return renderPrimary(cfg), nil
-		case "standby":
-			return renderStandby(cfg), nil
+		}
+		if targetLower == "standby" {
+			return renderStandbyNode(cfg, cfg.Standby), nil
+		}
+		// Cluster mode: match by standby name.
+		for _, s := range cfg.Standbys {
+			if strings.ToLower(s.Name) == targetLower {
+				return renderStandbyNode(cfg, s), nil
+			}
 		}
 	case "master-master":
 		switch strings.ToLower(strings.TrimSpace(target)) {
@@ -104,7 +126,7 @@ FROM pg_stat_replication;
 	)
 }
 
-func renderStandby(cfg Config) string {
+func renderStandbyNode(cfg Config, standby NodeConfig) string {
 	return fmt.Sprintf(`# Standby bootstrap for %s
 
 ## Stop PostgreSQL on standby before running this
@@ -135,7 +157,7 @@ hot_standby = on
 sudo systemctl start postgresql
 psql -c "SELECT pg_is_in_recovery();"
 `,
-		cfg.Standby.DataDir,
+		standby.DataDir,
 		cfg.ReplicationSlot,
 		cfg.Primary.Host,
 		cfg.Primary.Port,
