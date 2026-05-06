@@ -1,0 +1,28 @@
+run:
+  timeout: 3m
+
+linters:
+  enable:
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - gosimple
+    - gocritic
+    - bodyclose
+    - durationcheck
+    - exportloopref
+    - nilerr
+    - sqlclosecheck
+    - unconvert
+    - unparam
+    - wastedassign
+
+issues:
+  exclude-rules:
+    # Test files can have unused parameters and unchecked errors.
+    - path: _test\.go
+      linters:
+        - errcheck
+        - unparam

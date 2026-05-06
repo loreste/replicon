@@ -1,0 +1,33 @@
+{
+  "cluster_name": "orders-prod",
+  "mode": "master-master",
+  "replication_user": "replicator",
+  "node_a": {
+    "name": "writer-a",
+    "host": "10.0.0.10",
+    "port": 5432,
+    "data_dir": "/var/lib/postgresql/16/main",
+    "postgres_user": "postgres",
+    "ssh_user": "ubuntu",
+    "server_id": "pg-a",
+    "dsn_env": "REPLICON_NODE_A_DSN"
+  },
+  "node_b": {
+    "name": "writer-b",
+    "host": "10.0.0.11",
+    "port": 5432,
+    "data_dir": "/var/lib/postgresql/16/main",
+    "postgres_user": "postgres",
+    "ssh_user": "ubuntu",
+    "server_id": "pg-b",
+    "dsn_env": "REPLICON_NODE_B_DSN"
+  },
+  "logical": {
+    "database": "appdb",
+    "publication_a": "orders_pub_a",
+    "publication_b": "orders_pub_b",
+    "subscription_a": "orders_sub_a",
+    "subscription_b": "orders_sub_b",
+    "replication_cidr": "10.0.0.0/24"
+  }
+}

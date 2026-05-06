@@ -1,0 +1,156 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Install golangci-lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Unit tests with race detector
+        run: make test-race
+
+      - name: Build
+        run: make build
+
+      - name: Benchmarks
+        run: make bench
+
+  integration:
+    runs-on: ubuntu-latest
+    services:
+      primary:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: "--auth-host=trust"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5432:5432
+      standby:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: testpass
+          POSTGRES_DB: postgres
+          POSTGRES_INITDB_ARGS: "--auth-host=trust"
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+        ports:
+          - 5433:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        run: make build
+
+      - name: Set up replication
+        env:
+          PGPASSWORD: testpass
+        run: |
+          # Configure primary for replication.
+          psql -h 127.0.0.1 -p 5432 -U postgres -d postgres <<'SQL'
+            ALTER SYSTEM SET wal_level = replica;
+            ALTER SYSTEM SET max_wal_senders = 10;
+            ALTER SYSTEM SET max_replication_slots = 10;
+            ALTER SYSTEM SET hot_standby = on;
+            SELECT pg_reload_conf();
+            CREATE ROLE replicator WITH REPLICATION LOGIN PASSWORD 'testpass';
+            SELECT pg_create_physical_replication_slot('replicon_demo_slot')
+            WHERE NOT EXISTS (
+              SELECT 1 FROM pg_replication_slots WHERE slot_name = 'replicon_demo_slot'
+            );
+          SQL
+
+          # Add replication pg_hba entry on primary.
+          PRIMARY_CONTAINER=$(docker ps --filter "publish=5432" --format '{{.ID}}')
+          docker exec "$PRIMARY_CONTAINER" bash -c "echo 'host replication replicator all trust' >> /var/lib/postgresql/data/pg_hba.conf"
+          docker exec "$PRIMARY_CONTAINER" bash -c "su - postgres -c 'pg_ctl reload -D /var/lib/postgresql/data'"
+
+          # Rebuild standby from primary via pg_basebackup.
+          STANDBY_CONTAINER=$(docker ps --filter "publish=5433" --format '{{.ID}}')
+          docker exec "$STANDBY_CONTAINER" bash -c "su - postgres -c 'pg_ctl stop -D /var/lib/postgresql/data -m fast'" || true
+          sleep 2
+          docker exec "$STANDBY_CONTAINER" bash -c "rm -rf /var/lib/postgresql/data/*"
+          docker exec "$STANDBY_CONTAINER" bash -c "PGPASSWORD=testpass pg_basebackup --pgdata=/var/lib/postgresql/data --write-recovery-conf --slot=replicon_demo_slot --host=\$(getent hosts host.docker.internal | awk '{print \$1}' || echo 172.17.0.1) --port=5432 --username=replicator --checkpoint=fast" || \
+          docker exec "$STANDBY_CONTAINER" bash -c "rm -rf /var/lib/postgresql/data/* && PGPASSWORD=testpass pg_basebackup --pgdata=/var/lib/postgresql/data --write-recovery-conf --slot=replicon_demo_slot --host=172.17.0.1 --port=5432 --username=replicator --checkpoint=fast"
+          docker exec "$STANDBY_CONTAINER" bash -c "su - postgres -c 'pg_ctl start -D /var/lib/postgresql/data -l /var/lib/postgresql/pg.log'"
+
+          # Wait for standby to come up and start streaming.
+          for i in $(seq 1 30); do
+            if psql -h 127.0.0.1 -p 5433 -U postgres -tAc "SELECT pg_is_in_recovery();" 2>/dev/null | grep -q t; then
+              echo "Standby is in recovery mode"
+              break
+            fi
+            echo "Waiting for standby... ($i)"
+            sleep 2
+          done
+
+          # Verify primary sees the standby.
+          psql -h 127.0.0.1 -p 5432 -U postgres -c "SELECT application_name, client_addr, state FROM pg_stat_replication;"
+
+      - name: Run integration tests
+        env:
+          CI: "true"
+          REPLICON_PRIMARY_DSN: "postgres://postgres:testpass@127.0.0.1:5432/postgres?sslmode=disable"
+          REPLICON_STANDBY_DSN: "postgres://postgres:testpass@127.0.0.1:5433/postgres?sslmode=disable"
+        run: make test-integration
+
+      - name: CLI verify
+        env:
+          REPLICON_PRIMARY_DSN: "postgres://postgres:testpass@127.0.0.1:5432/postgres?sslmode=disable"
+          REPLICON_STANDBY_DSN: "postgres://postgres:testpass@127.0.0.1:5433/postgres?sslmode=disable"
+        run: |
+          bin/replicon init -mode master-slave > /tmp/replicon-ci.json
+          bin/replicon validate -config /tmp/replicon-ci.json
+          bin/replicon plan -config /tmp/replicon-ci.json
+          bin/replicon render -config /tmp/replicon-ci.json -target primary
+          bin/replicon render -config /tmp/replicon-ci.json -target standby
+          bin/replicon verify -config /tmp/replicon-ci.json -output json

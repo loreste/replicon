@@ -1,0 +1,30 @@
+{
+  "cluster_name": "orders-prod",
+  "mode": "master-slave",
+  "replication_user": "replicator",
+  "replication_slot": "orders_prod_standby",
+  "primary": {
+    "name": "primary-a",
+    "host": "10.0.0.10",
+    "port": 5432,
+    "data_dir": "/var/lib/postgresql/16/main",
+    "postgres_user": "postgres",
+    "ssh_user": "ubuntu",
+    "server_id": "pg-a",
+    "dsn_env": "REPLICON_PRIMARY_DSN"
+  },
+  "standby": {
+    "name": "standby-b",
+    "host": "10.0.0.11",
+    "port": 5432,
+    "data_dir": "/var/lib/postgresql/16/main",
+    "postgres_user": "postgres",
+    "ssh_user": "ubuntu",
+    "server_id": "pg-b",
+    "dsn_env": "REPLICON_STANDBY_DSN"
+  },
+  "network": {
+    "replication_cidr": "10.0.0.11/32",
+    "application_name": "orders-prod-standby"
+  }
+}

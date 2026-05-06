@@ -1,0 +1,8 @@
+.git
+.gitignore
+tmp
+var
+*.log
+*.pem
+*.key
+*.crt

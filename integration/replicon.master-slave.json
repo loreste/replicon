@@ -1,0 +1,30 @@
+{
+  "cluster_name": "orders-demo",
+  "mode": "master-slave",
+  "replication_user": "replicator",
+  "replication_slot": "replicon_demo_slot",
+  "primary": {
+    "name": "primary",
+    "host": "127.0.0.1",
+    "port": 55432,
+    "data_dir": "/var/lib/postgresql/data",
+    "postgres_user": "postgres",
+    "ssh_user": "postgres",
+    "server_id": "demo-primary",
+    "dsn_env": "REPLICON_DEMO_PRIMARY_DSN"
+  },
+  "standby": {
+    "name": "standby",
+    "host": "127.0.0.2",
+    "port": 55433,
+    "data_dir": "/var/lib/postgresql/data",
+    "postgres_user": "postgres",
+    "ssh_user": "postgres",
+    "server_id": "demo-standby",
+    "dsn_env": "REPLICON_DEMO_STANDBY_DSN"
+  },
+  "network": {
+    "replication_cidr": "127.0.0.0/8",
+    "application_name": "orders-prod-standby"
+  }
+}

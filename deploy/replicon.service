@@ -1,0 +1,27 @@
+[Unit]
+Description=replicon replication control service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=replicon
+Group=replicon
+WorkingDirectory=/opt/replicon
+EnvironmentFile=/etc/replicon/replicon.env
+ExecStart=/usr/local/bin/replicon serve \
+  -config /etc/replicon/replicon.json \
+  -listen :8443 \
+  -tls-cert /etc/replicon/tls/server.crt \
+  -tls-key /etc/replicon/tls/server.key \
+  -audit-log /var/lib/replicon/audit/replicon.jsonl
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/replicon
+
+[Install]
+WantedBy=multi-user.target

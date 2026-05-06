@@ -1,0 +1,48 @@
+services:
+  node-a:
+    image: postgres:16
+    container_name: replicon-node-a
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: appdb
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "55532:5432"
+    volumes:
+      - node-a-data:/var/lib/postgresql/data
+      - ./mm-init.sh:/docker-entrypoint-initdb.d/00-mm-init.sh:ro
+      - ./postgresql.logical.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.logical.conf:/etc/postgresql/pg_hba.conf:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  node-b:
+    image: postgres:16
+    container_name: replicon-node-b
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: appdb
+      PGDATA: /var/lib/postgresql/data
+    ports:
+      - "55533:5432"
+    volumes:
+      - node-b-data:/var/lib/postgresql/data
+      - ./mm-init.sh:/docker-entrypoint-initdb.d/00-mm-init.sh:ro
+      - ./postgresql.logical.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.logical.conf:/etc/postgresql/pg_hba.conf:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d appdb"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  node-a-data:
+  node-b-data:

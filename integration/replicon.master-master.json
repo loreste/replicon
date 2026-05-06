@@ -1,0 +1,33 @@
+{
+  "cluster_name": "orders-mm-demo",
+  "mode": "master-master",
+  "replication_user": "replicator",
+  "node_a": {
+    "name": "node-a",
+    "host": "127.0.0.1",
+    "port": 55532,
+    "data_dir": "/var/lib/postgresql/data",
+    "postgres_user": "postgres",
+    "ssh_user": "postgres",
+    "server_id": "demo-node-a",
+    "dsn_env": "REPLICON_NODE_A_DSN"
+  },
+  "node_b": {
+    "name": "node-b",
+    "host": "127.0.0.2",
+    "port": 55533,
+    "data_dir": "/var/lib/postgresql/data",
+    "postgres_user": "postgres",
+    "ssh_user": "postgres",
+    "server_id": "demo-node-b",
+    "dsn_env": "REPLICON_NODE_B_DSN"
+  },
+  "logical": {
+    "database": "appdb",
+    "publication_a": "orders_pub_a",
+    "publication_b": "orders_pub_b",
+    "subscription_a": "orders_sub_a",
+    "subscription_b": "orders_sub_b",
+    "replication_cidr": "0.0.0.0/0"
+  }
+}

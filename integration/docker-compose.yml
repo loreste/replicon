@@ -1,0 +1,55 @@
+services:
+  primary:
+    build:
+      context: ..
+      dockerfile: integration/primary.Dockerfile
+    container_name: replicon-primary
+    environment:
+      POSTGRES_PASSWORD: ${INTEGRATION_POSTGRES_PASSWORD}
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres
+      PGDATA: /var/lib/postgresql/data
+      REPLICATION_PASSWORD: ${INTEGRATION_REPLICATION_PASSWORD}
+      REPLICATION_SLOT: ${INTEGRATION_REPLICATION_SLOT:-replicon_demo_slot}
+    ports:
+      - "55432:5432"
+    volumes:
+      - primary-data:/var/lib/postgresql/data
+      - ./postgresql.primary.conf:/etc/postgresql/postgresql.conf:ro
+      - ./pg_hba.primary.conf:/etc/postgresql/pg_hba.conf:ro
+    command: ["postgres", "-c", "config_file=/etc/postgresql/postgresql.conf", "-c", "hba_file=/etc/postgresql/pg_hba.conf"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  standby:
+    image: postgres:16
+    container_name: replicon-standby
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      PRIMARY_HOST: primary
+      PRIMARY_PORT: "5432"
+      REPLICATION_USER: replicator
+      REPLICATION_PASSWORD: ${INTEGRATION_REPLICATION_PASSWORD}
+      REPLICATION_SLOT: ${INTEGRATION_REPLICATION_SLOT:-replicon_demo_slot}
+      APPLICATION_NAME: orders-prod-standby
+    depends_on:
+      primary:
+        condition: service_healthy
+    ports:
+      - "55433:5432"
+    volumes:
+      - standby-data:/var/lib/postgresql/data
+      - ./standby-entrypoint.sh:/usr/local/bin/standby-entrypoint.sh:ro
+    entrypoint: ["sh", "/usr/local/bin/standby-entrypoint.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  primary-data:
+  standby-data:
