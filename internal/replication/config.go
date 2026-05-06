@@ -45,14 +45,45 @@ func (c Config) IsCluster() bool {
 
 // Failover configures the automatic failover watchdog.
 type Failover struct {
-	Enabled            bool          `json:"enabled"`
-	CheckIntervalSec   int           `json:"check_interval_sec"`
-	HealthTimeoutSec   int           `json:"health_timeout_sec"`
-	MaxFailures        int           `json:"max_failures"`
-	FenceTimeoutSec    int           `json:"fence_timeout_sec"`
-	FenceCommand       string        `json:"fence_command,omitempty"`
-	PostPromoteCommand string        `json:"post_promote_command,omitempty"`
-	Witness            WitnessConfig `json:"witness,omitempty"`
+	Enabled            bool           `json:"enabled"`
+	CheckIntervalSec   int            `json:"check_interval_sec"`
+	HealthTimeoutSec   int            `json:"health_timeout_sec"`
+	MaxFailures        int            `json:"max_failures"`
+	FenceTimeoutSec    int            `json:"fence_timeout_sec"`
+	FenceCommand       string         `json:"fence_command,omitempty"`
+	PostPromoteCommand string         `json:"post_promote_command,omitempty"`
+	Witness            WitnessConfig  `json:"witness,omitempty"`
+	Election           ElectionConfig `json:"election,omitempty"`
+}
+
+// ElectionConfig configures PostgreSQL-based leader election. When enabled,
+// multiple replicon agents can run against the same cluster. Only the elected
+// leader is allowed to execute failover. The others remain on standby and
+// take over leadership if the current leader stops heartbeating.
+//
+// The coordination database should be a PostgreSQL instance independent of
+// the primary and standbys (the witness database works well for this).
+type ElectionConfig struct {
+	Enabled      bool   `json:"enabled"`
+	DSN          string `json:"dsn,omitempty"`
+	DSNEnv       string `json:"dsn_env,omitempty"`
+	NodeID       string `json:"node_id"`
+	LeaseTTLSec  int    `json:"lease_ttl_sec"`
+	RenewSec     int    `json:"renew_sec"`
+}
+
+func (e ElectionConfig) ResolveDSN() (string, error) {
+	if value := strings.TrimSpace(e.DSN); value != "" {
+		return value, nil
+	}
+	if envName := strings.TrimSpace(e.DSNEnv); envName != "" {
+		value := strings.TrimSpace(os.Getenv(envName))
+		if value == "" {
+			return "", fmt.Errorf("environment variable %q is not set", envName)
+		}
+		return value, nil
+	}
+	return "", errors.New("election dsn or dsn_env is required")
 }
 
 // WitnessConfig defines an independent observer that breaks ties when the

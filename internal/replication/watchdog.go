@@ -81,6 +81,22 @@ func RunWatchdog(ctx context.Context, cfg Config, service *Service, cb WatchdogC
 		}
 	}
 
+	// Start leader election if configured.
+	var election *LeaderElection
+	if cfg.Failover.Election.Enabled {
+		election = NewLeaderElection(cfg.Failover.Election, cfg.ClusterName)
+		go func() {
+			if err := election.Run(ctx, emit); err != nil && err != context.Canceled {
+				log.Printf("replicon: election loop exited: %v", err)
+			}
+		}()
+		emit(WatchdogEvent{
+			Time:    time.Now().UTC(),
+			Type:    "election",
+			Message: fmt.Sprintf("leader election enabled (node %s, ttl %ds)", cfg.Failover.Election.NodeID, cfg.Failover.Election.LeaseTTLSec),
+		})
+	}
+
 	consecutiveFailures := 0
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
@@ -127,6 +143,19 @@ func RunWatchdog(ctx context.Context, cfg Config, service *Service, cb WatchdogC
 			continue
 		}
 
+		// If leader election is enabled, only the leader may trigger failover.
+		if election != nil && !election.IsLeader() {
+			emit(WatchdogEvent{
+				Time:        time.Now().UTC(),
+				Type:        "election",
+				Message:     "failure threshold reached but this agent is not the leader — deferring to leader",
+				Failures:    consecutiveFailures,
+				MaxFailures: f.MaxFailures,
+			})
+			consecutiveFailures = 0
+			continue
+		}
+
 		if cb.DryRun {
 			emit(WatchdogEvent{
 				Time:        time.Now().UTC(),
@@ -135,12 +164,11 @@ func RunWatchdog(ctx context.Context, cfg Config, service *Service, cb WatchdogC
 				Failures:    consecutiveFailures,
 				MaxFailures: f.MaxFailures,
 			})
-			// Reset counter so dry-run keeps monitoring.
 			consecutiveFailures = 0
 			continue
 		}
 
-		// Threshold reached — attempt fence-then-promote.
+		// Threshold reached and we are the leader (or no election) — attempt fence-then-promote.
 		return executeFenceAndPromote(ctx, cfg, f, fenceTimeout, service, emit)
 	}
 }
